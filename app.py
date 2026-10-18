@@ -26,27 +26,6 @@ def secret(name, default=""):
 
 
 ESTAT_APP_ID = secret("ESTAT_APP_ID")
-
-import requests
-
-url = "https://api.e-stat.go.jp/rest/3.0/app/json/getStatsData"
-
-response = requests.get(
-    url,
-    params={
-        "appId": ESTAT_APP_ID,
-        "statsDataId": "0003285828",
-        "limit": 1,
-    },
-    timeout=30,
-)
-
-print("HTTPステータス:", response.status_code)
-print(response.json())
-
-print("リクエストURL:", response.url)
-print("レスポンス:", response.text[:1000])
-
 GROQ_API_KEY = secret("GROQ_API_KEY")
 GROQ_MODEL = secret("GROQ_MODEL", "openai/gpt-oss-20b")
 
