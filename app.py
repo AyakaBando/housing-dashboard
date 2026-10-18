@@ -1,3 +1,227 @@
+import os
+import re
+from datetime import datetime
+
+import pandas as pd
+import plotly.express as px
+import requests
+import streamlit as st
+from groq import Groq
+
+st.set_page_config(page_title="住宅着工統計ダッシュボード", page_icon="🏠", layout="wide")
+
+BASE_URL = "https://api.e-stat.go.jp/rest/3.0/app/json"
+STATS_DATA_ID = "0003285828"
+CACHE_SECONDS = 60 * 60 * 6
+PAGE_SIZE = 100000
+MAX_RECORDS = 500000
+
+
+def secret(name, default=""):
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:
+        value = default
+    return os.getenv(name, value) or default
+
+
+ESTAT_APP_ID = secret("ESTAT_APP_ID")
+GROQ_API_KEY = secret("GROQ_API_KEY")
+GROQ_MODEL = secret("GROQ_MODEL", "openai/gpt-oss-20b")
+
+
+def as_list(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def text_value(value):
+    if isinstance(value, dict):
+        return str(value.get("$", value.get("#text", "")))
+    return "" if value is None else str(value)
+
+
+def api_get(endpoint, params):
+    if not ESTAT_APP_ID:
+        raise ValueError("ESTAT_APP_ID が未設定です。Streamlit Secretsを確認してください。")
+    response = requests.get(
+        f"{BASE_URL}/{endpoint}",
+        params={"appId": ESTAT_APP_ID, "lang": "J", **params},
+        timeout=90,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    root_key = {
+        "getStatsData": "GET_STATS_DATA",
+        "getMetaInfo": "GET_META_INFO",
+    }.get(endpoint, "GET_STATS_LIST")
+    root = payload.get(root_key, {})
+    result = root.get("RESULT", {})
+    if str(result.get("STATUS", "0")) != "0":
+        raise RuntimeError(result.get("ERROR_MSG", "e-Stat APIエラー"))
+    return root
+
+
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
+def load_metadata(app_id, table_id):
+    # Cache is keyed by app ID and table ID; app ID is also sent explicitly.
+    root = api_get("getMetaInfo", {"statsDataId": table_id})
+    meta = root.get("METADATA_INF", {})
+    class_objs = as_list(meta.get("CLASS_INF", {}).get("CLASS_OBJ"))
+    dimensions = {}
+    for obj in class_objs:
+        dim_id = str(obj.get("@id", ""))
+        if not dim_id:
+            continue
+        labels = {}
+        for item in as_list(obj.get("CLASS")):
+            code = str(item.get("@code", ""))
+            name = str(item.get("@name", code))
+            if code:
+                labels[code] = name
+        dimensions[dim_id] = {
+            "name": str(obj.get("@name", dim_id)),
+            "labels": labels,
+        }
+    return dimensions
+
+
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
+def load_data(app_id, table_id):
+    all_rows = []
+    start = 1
+    dimensions = {}
+
+    while len(all_rows) < MAX_RECORDS:
+        root = api_get(
+            "getStatsData",
+            {
+                "statsDataId": table_id,
+                "metaGetFlg": "Y" if start == 1 else "N",
+                "cntGetFlg": "Y" if start == 1 else "N",
+                "limit": PAGE_SIZE,
+                "startPosition": start,
+            },
+        )
+        stat = root.get("STATISTICAL_DATA", {})
+        if start == 1:
+            meta = stat.get("CLASS_INF", {})
+            for obj in as_list(meta.get("CLASS_OBJ")):
+                dim_id = str(obj.get("@id", ""))
+                if not dim_id:
+                    continue
+                labels = {}
+                for item in as_list(obj.get("CLASS")):
+                    code = str(item.get("@code", ""))
+                    if code:
+                        labels[code] = str(item.get("@name", code))
+                dimensions[dim_id] = {
+                    "name": str(obj.get("@name", dim_id)),
+                    "labels": labels,
+                }
+
+        data_info = stat.get("DATA_INF", {})
+        values = as_list(data_info.get("VALUE"))
+        if not values:
+            break
+
+        all_rows.extend(values)
+        result_info = data_info.get("RESULT_INF", {})
+        total = int(result_info.get("TOTAL_NUMBER", 0) or 0)
+        if len(all_rows) >= total or len(values) < PAGE_SIZE:
+            break
+        start += len(values)
+
+    rows = []
+    for item in all_rows[:MAX_RECORDS]:
+        row = {}
+        for key, value in item.items():
+            if key == "$":
+                continue
+            # e-Stat category codes use attributes such as @area, @time, @cat01.
+            row[key.lstrip("@")] = str(value)
+        raw_value = item.get("$")
+        try:
+            row["value"] = float(str(raw_value).replace(",", ""))
+        except (ValueError, TypeError):
+            row["value"] = None
+        row["unit"] = str(item.get("@unit", ""))
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.dropna(subset=["value"])
+    return df, dimensions
+
+
+def label_for(dim_id, code, dimensions):
+    info = dimensions.get(dim_id, {})
+    return info.get("labels", {}).get(str(code), str(code))
+
+
+def find_dimension(df, dimensions, candidates):
+    # Prefer known e-Stat dimension IDs, then use the Japanese dimension name.
+    for candidate in candidates:
+        if candidate in df.columns and candidate in dimensions:
+            return candidate
+    for dim_id, info in dimensions.items():
+        if dim_id in df.columns and any(word in info.get("name", "") for word in candidates):
+            return dim_id
+    return None
+
+
+def time_sort_value(value):
+    s = str(value)
+    # e-Stat time codes commonly look like 202401, 2024年度, or YYYYMM.
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 6:
+        return int(digits[:6])
+    if len(digits) >= 4:
+        return int(digits[:4]) * 100
+    return -1
+
+
+st.title("住宅着工統計ダッシュボード")
+st.caption("出典：政府統計の総合窓口（e-Stat）")
+st.caption(f"使用する統計表ID：{STATS_DATA_ID}")
+
+if not ESTAT_APP_ID:
+    st.error("e-StatのアプリケーションID（ESTAT_APP_ID）が設定されていません。")
+    st.stop()
+
+try:
+    with st.spinner("e-Statからデータを取得しています..."):
+        df, dimensions = load_data(ESTAT_APP_ID, STATS_DATA_ID)
+except Exception as exc:
+    st.error(f"データ取得に失敗しました：{exc}")
+    st.info("e-StatのアプリケーションIDと、統計表IDがAPIで利用できることを確認してください。")
+    st.stop()
+
+if df.empty:
+    st.warning("この統計表から数値データを取得できませんでした。")
+    st.stop()
+
+time_dim = find_dimension(df, dimensions, ["time", "時間"])
+area_dim = find_dimension(df, dimensions, ["area", "地域"])
+unit_values = sorted(df["unit"].dropna().astype(str).unique()) if "unit" in df else []
+dimension_ids = [
+    dim_id for dim_id in dimensions
+    if dim_id in df.columns and dim_id not in {time_dim, area_dim}
+    and df[dim_id].nunique(dropna=True) > 1
+]
+
+# Add human-readable labels for each classification.
+for dim_id in dimensions:
+    if dim_id in df.columns:
+        df[f"{dim_id}_label"] = df[dim_id].map(lambda x: label_for(dim_id, x, dimensions))
+
+st.success(f"取得件数：{len(df):,}件")
+if time_dim:
+    df["_time_sort"] = df[time_dim].map(time_sort_value)
+    df["_time_label"] = df[time_dim].map(lambda x: label_for(time_dim, x, dimensions))
+else:
+    df["_time_sort"] = 0
     df["_time_label"] = "時点なし"
 
 # Sidebar filters
