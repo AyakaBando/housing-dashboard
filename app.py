@@ -235,8 +235,10 @@ try:
     with st.spinner("e-Statからデータを取得しています..."):
         df, dimensions = load_data(ESTAT_APP_ID, STATS_DATA_ID)
 except Exception as exc:
+    import traceback
+
     st.error(f"データ取得に失敗しました：{exc}")
-    st.info("e-StatのアプリケーションIDと、統計表IDがAPIで利用できることを確認してください。")
+    st.code(traceback.format_exc())
     st.stop()
 
 if df.empty:
