@@ -146,8 +146,16 @@ def load_data(app_id, table_id):
             },
         )
         stat = root.get("STATISTICAL_DATA", {})
+
+        if not isinstance(stat, dict):
+            raise RuntimeError(
+                f"STATISTICAL_DATAの型が想定外です。"
+                f"型: {type(stat).__name__}、内容: {str(stat)[:500]}"
+            )
+
         if start == 1:
             meta = stat.get("CLASS_INF", {})
+
             for obj in as_list(meta.get("CLASS_OBJ")):
                 dim_id = str(obj.get("@id", ""))
                 if not dim_id:
@@ -163,6 +171,14 @@ def load_data(app_id, table_id):
                 }
 
         data_info = stat.get("DATA_INF", {})
+
+        if not isinstance(data_info, dict):
+            raise RuntimeError(
+                f"DATA_INFの型が想定外です。"
+                f"型: {type(data_info).__name__}、"
+                f"内容: {str(data_info)[:500]}"
+        )
+
         values = as_list(data_info.get("VALUE"))
         if not values:
             break
