@@ -44,6 +44,9 @@ response = requests.get(
 print("HTTPステータス:", response.status_code)
 print(response.json())
 
+print("リクエストURL:", response.url)
+print("レスポンス:", response.text[:1000])
+
 GROQ_API_KEY = secret("GROQ_API_KEY")
 GROQ_MODEL = secret("GROQ_MODEL", "openai/gpt-oss-20b")
 
