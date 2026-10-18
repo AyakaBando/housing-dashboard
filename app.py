@@ -66,7 +66,7 @@ def text_value(value):
 def api_get(endpoint, params):
     if not ESTAT_APP_ID:
         raise ValueError(
-            "ESTAT_APP_ID が未設定です。Secretsを確認してください。"
+            "ESTAT_APP_ID が未設定です。Streamlit Secretsを確認してください。"
         )
 
     response = requests.get(
@@ -84,15 +84,12 @@ def api_get(endpoint, params):
         payload = response.json()
     except ValueError:
         raise RuntimeError(
-            f"e-StatがJSON以外を返しました。"
-            f"HTTP={response.status_code}, "
-            f"内容={response.text[:500]}"
+            f"e-Stat APIがJSON以外を返しました。HTTPステータス: {response.status_code}"
         )
 
     if not isinstance(payload, dict):
         raise RuntimeError(
-            f"APIレスポンスが辞書形式ではありません。"
-            f"型={type(payload).__name__}, 内容={str(payload)[:500]}"
+            f"e-Stat APIの応答が辞書形式ではありません。型: {type(payload).__name__}"
         )
 
     root_key = {
@@ -105,21 +102,21 @@ def api_get(endpoint, params):
 
     if not isinstance(root, dict):
         raise RuntimeError(
-            f"APIレスポンスに {root_key} がありません。"
-            f"内容={str(payload)[:1000]}"
+            f"e-Stat APIの応答形式が想定外です。"
+            f"期待する項目: {root_key}、"
+            f"実際の項目: {list(payload.keys())}"
         )
 
     result = root.get("RESULT", {})
 
     if not isinstance(result, dict):
         raise RuntimeError(
-            f"APIのRESULTが辞書形式ではありません。"
-            f"内容={str(result)[:500]}"
+            f"e-Stat APIのRESULTが辞書形式ではありません。"
         )
 
     status = str(result.get("STATUS", "0"))
 
-    if status != "0":
+    if status not in ("0", "1", "2"):
         raise RuntimeError(
             f"e-Stat APIエラー（STATUS={status}）："
             f"{result.get('ERROR_MSG', '詳細不明')}"
