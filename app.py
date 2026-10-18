@@ -65,23 +65,68 @@ def text_value(value):
 
 def api_get(endpoint, params):
     if not ESTAT_APP_ID:
-        raise ValueError("ESTAT_APP_ID が未設定です。Streamlit Secretsを確認してください。")
+        raise ValueError(
+            "ESTAT_APP_ID が未設定です。Secretsを確認してください。"
+        )
+
     response = requests.get(
         f"{BASE_URL}/{endpoint}",
-        params={"appId": ESTAT_APP_ID, "lang": "J", **params},
+        params={
+            "appId": ESTAT_APP_ID,
+            "lang": "J",
+            **params,
+        },
         timeout=90,
     )
     response.raise_for_status()
-    payload = response.json()
+
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            f"e-StatがJSON以外を返しました。"
+            f"HTTP={response.status_code}, "
+            f"内容={response.text[:500]}"
+        )
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"APIレスポンスが辞書形式ではありません。"
+            f"型={type(payload).__name__}, 内容={str(payload)[:500]}"
+        )
+
     root_key = {
         "getStatsData": "GET_STATS_DATA",
         "getMetaInfo": "GET_META_INFO",
-    }.get(endpoint, "GET_STATS_LIST")
-    root = payload.get(root_key, {})
+        "getStatsList": "GET_STATS_LIST",
+    }.get(endpoint)
+
+    root = payload.get(root_key)
+
+    if not isinstance(root, dict):
+        raise RuntimeError(
+            f"APIレスポンスに {root_key} がありません。"
+            f"内容={str(payload)[:1000]}"
+        )
+
     result = root.get("RESULT", {})
-    if str(result.get("STATUS", "0")) != "0":
-        raise RuntimeError(result.get("ERROR_MSG", "e-Stat APIエラー"))
+
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            f"APIのRESULTが辞書形式ではありません。"
+            f"内容={str(result)[:500]}"
+        )
+
+    status = str(result.get("STATUS", "0"))
+
+    if status != "0":
+        raise RuntimeError(
+            f"e-Stat APIエラー（STATUS={status}）："
+            f"{result.get('ERROR_MSG', '詳細不明')}"
+        )
+
     return root
+
 
 
 @st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
