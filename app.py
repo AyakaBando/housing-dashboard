@@ -171,6 +171,9 @@ def load_data(app_id, table_id):
                 }
 
         data_info = stat.get("DATA_INF", {})
+        st.write("API応答のSTATISTICAL_DATAの項目:", list(stat.keys()))
+        st.write("DATA_INFの型:", type(data_info).__name__)
+        st.write("DATA_INFの内容:", repr(data_info)[:1000])
 
         if not isinstance(data_info, dict):
             raise RuntimeError(
