@@ -84,12 +84,13 @@ def api_get(endpoint, params):
         payload = response.json()
     except ValueError:
         raise RuntimeError(
-            f"e-Stat APIがJSON以外を返しました。HTTPステータス: {response.status_code}"
+            f"e-Stat APIがJSON以外を返しました。"
+            f"HTTPステータス: {response.status_code}"
         )
 
     if not isinstance(payload, dict):
         raise RuntimeError(
-            f"e-Stat APIの応答が辞書形式ではありません。型: {type(payload).__name__}"
+            f"e-Statの応答形式が不正です。型: {type(payload).__name__}"
         )
 
     root_key = {
@@ -102,21 +103,19 @@ def api_get(endpoint, params):
 
     if not isinstance(root, dict):
         raise RuntimeError(
-            f"e-Stat APIの応答形式が想定外です。"
-            f"期待する項目: {root_key}、"
-            f"実際の項目: {list(payload.keys())}"
+            f"e-Statの応答に {root_key} がありません。"
+            f"応答項目: {list(payload.keys())}"
         )
 
     result = root.get("RESULT", {})
 
     if not isinstance(result, dict):
-        raise RuntimeError(
-            f"e-Stat APIのRESULTが辞書形式ではありません。"
-        )
+        raise RuntimeError("e-StatのRESULTが想定外の形式です。")
 
     status = str(result.get("STATUS", "0"))
 
-    if status not in ("0", "1", "2"):
+    # STATUSが0以外なら、APIのエラーとして扱う
+    if status != "0":
         raise RuntimeError(
             f"e-Stat APIエラー（STATUS={status}）："
             f"{result.get('ERROR_MSG', '詳細不明')}"
