@@ -1,9 +1,11 @@
 import io
+import json
 import re
 import unicodedata
 from datetime import datetime
 
 import pandas as pd
+from groq import Groq
 import plotly.express as px
 import requests
 import streamlit as st
@@ -23,6 +25,21 @@ SOURCE_PAGE = (
 )
 CACHE_SECONDS = 6 * 60 * 60
 START_DATE = pd.Timestamp("2020-01-01")
+GROQ_MODEL_DEFAULT = "openai/gpt-oss-20b"
+
+
+def get_secret(name, default=""):
+    """Read a setting from Streamlit Secrets first, then environment variables."""
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:
+        value = default
+    import os
+    return os.getenv(name, value) or default
+
+
+GROQ_API_KEY = get_secret("GROQ_API_KEY")
+GROQ_MODEL = get_secret("GROQ_MODEL", GROQ_MODEL_DEFAULT)
 
 PREFECTURE_ALIASES = {
     "北海道": "北海道",
@@ -320,6 +337,91 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
 )
+
+st.subheader("AIによる分析（Groq）")
+if not GROQ_API_KEY:
+    st.info(
+        "AI分析を利用するには、Streamlit Community Cloudのアプリ設定で "
+        "Secrets に GROQ_API_KEY を設定してください。"
+    )
+    st.markdown("[Groq APIキーの管理画面を開く](https://console.groq.com/keys)")
+else:
+    st.caption(
+        "表示中の統計データをGroqで分析します。"
+        "分析結果は参考情報であり、原因を断定するものではありません。"
+    )
+    if st.button("住宅着工統計をAIで分析", type="primary"):
+        try:
+            # Send a compact summary rather than the entire dataset.
+            recent_national = national.tail(36).copy()
+            recent_national["年月"] = recent_national["年月"].dt.strftime("%Y-%m")
+            national_records = recent_national[
+                ["年月", "住宅着工戸数", "前年同月比（％）"]
+            ].where(pd.notna(recent_national[
+                ["年月", "住宅着工戸数", "前年同月比（％）"]
+            ]), None).to_dict(orient="records")
+
+            recent_region = region_df.tail(36).copy()
+            recent_region["年月"] = recent_region["年月"].dt.strftime("%Y-%m")
+            region_records = recent_region[
+                ["年月", "住宅着工戸数", "前年同月比（％）"]
+            ].where(pd.notna(recent_region[
+                ["年月", "住宅着工戸数", "前年同月比（％）"]
+            ]), None).to_dict(orient="records")
+
+            comparison = latest_pref[
+                ["地域", "住宅着工戸数", "前年同月比（％）"]
+            ].copy()
+            comparison["前年同月比（％）"] = comparison["前年同月比（％）"].round(1)
+            comparison_records = comparison.head(10).where(
+                pd.notna(comparison.head(10)), None
+            ).to_dict(orient="records")
+
+            prompt_data = {
+                "最新公表月": latest_month.strftime("%Y-%m"),
+                "分析対象地域": selected_region,
+                "全国直近36か月": national_records,
+                "選択地域直近36か月": region_records,
+                "最新月の都道府県別着工戸数上位10": comparison_records,
+            }
+
+            client = Groq(api_key=GROQ_API_KEY, timeout=60.0)
+            completion = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "あなたは日本の住宅着工統計を分析するアナリストです。"
+                            "必ず日本語で回答してください。"
+                            "提供された数値だけを根拠に、観察できる傾向、"
+                            "前年同月比の動き、地域差、今後確認したい点を整理してください。"
+                            "データにない数値を作らず、因果関係は断定せず、"
+                            "推測は推測と明記してください。"
+                            "見出しと箇条書きを使い、読みやすく簡潔に説明してください。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "次の住宅着工統計を分析してください。\n\n"
+                            + json.dumps(prompt_data, ensure_ascii=False, default=str)
+                        ),
+                    },
+                ],
+                temperature=0.2,
+                max_completion_tokens=2500,
+            )
+            analysis_text = completion.choices[0].message.content
+            if analysis_text:
+                st.markdown(analysis_text)
+            else:
+                st.warning("AIから空の回答が返されました。もう一度お試しください。")
+        except Exception as exc:
+            st.error(
+                "AI分析に失敗しました。Groq APIキー、モデル名、"
+                f"利用上限を確認してください。詳細：{exc}"
+            )
 
 with st.expander("取得データ・更新情報"):
     st.write(f"データ最終月：{latest_month:%Y年%m月}")
