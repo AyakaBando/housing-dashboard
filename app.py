@@ -105,21 +105,35 @@ def download_workbook(file_url: str) -> dict[str, pd.DataFrame]:
     response = session.get(file_url, timeout=90)
     response.raise_for_status()
     body = response.content
+    content_type = response.headers.get("content-type", "不明")
 
-    # XLSX is a ZIP archive and starts with PK. This check avoids passing an HTML
-    # error/login page to pandas, which would produce a misleading Excel error.
-    if not body.startswith(b"PK"):
-        content_type = response.headers.get("content-type", "不明")
-        preview = response.text[:240].replace("\n", " ") if body else "(空の応答)"
+    # e-Stat files may be modern .xlsx (ZIP/PK signature) or legacy .xls
+    # (OLE Compound File signature). Do not treat every non-PK response as an error.
+    if body.startswith(b"PK\x03\x04"):
+        engine = "openpyxl"
+    elif body.startswith(bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1")):
+        engine = "xlrd"
+    else:
+        # Only decode a small preview when this really appears to be text/HTML.
+        preview = "(空の応答)"
+        if body:
+            if "text" in content_type.lower() or "html" in content_type.lower():
+                preview = body[:240].decode(response.encoding or "utf-8", errors="replace").replace("\n", " ")
+            else:
+                preview = f"先頭バイト={body[:16].hex(' ')}; サイズ={len(body)} bytes"
         raise RuntimeError(
-            "e-StatのExcelリンクからExcelファイルが返されませんでした。"
-            f" Content-Type={content_type}; 応答={preview}"
+            "e-Statのダウンロード先からExcelとして認識できるファイルが返されませんでした。"
+            f" Content-Type={content_type}; {preview}"
         )
 
     try:
-        sheets = pd.read_excel(io.BytesIO(body), sheet_name=None, header=None, engine="openpyxl")
+        sheets = pd.read_excel(io.BytesIO(body), sheet_name=None, header=None, engine=engine)
     except Exception as exc:
-        raise RuntimeError(f"ダウンロードしたファイルをExcelとして読み込めませんでした: {exc}") from exc
+        raise RuntimeError(
+            f"e-Statのファイルは取得できましたが、{engine}でExcelを読み込めませんでした: {exc}"
+        ) from exc
+    if not sheets:
+        raise RuntimeError("Excelファイル内に読み取れるシートがありませんでした。")
     return {str(name): frame for name, frame in sheets.items()}
 
 
