@@ -1,439 +1,322 @@
 import io
-import json
 import re
-import unicodedata
-from datetime import datetime
-
-import pandas as pd
-from groq import Groq
-import plotly.express as px
-import requests
-import streamlit as st
-import xlrd
-from bs4 import BeautifulSoup
+from datetime import date
 from urllib.parse import urljoin
 
-st.set_page_config(
-    page_title="住宅着工統計ダッシュボード",
-    page_icon="🏠",
-    layout="wide",
+import pandas as pd
+import requests
+import streamlit as st
+import plotly.express as px
+from bs4 import BeautifulSoup
+
+# e-Stat official dataset page for monthly housing starts by prefecture.
+ESTAT_HOUSING_LIST_URL = (
+    "https://www.e-stat.go.jp/stat-search/files"
+    "?cycle=1&kikan=00600&layout=dataset&"
+    "tclass1=000001048390&tclass2val=0&toukei=00600120&tstat=000001016966"
 )
-
-SOURCE_PAGE = (
-    "https://www.mlit.go.jp/sogoseisaku/jouhouka/"
-    "sosei_jouhouka_tk4_000002.html"
+ESTAT_RENOVATION_LIST_URL = (
+    "https://www.e-stat.go.jp/stat-search/files"
+    "?kikan=00600&layout=dataset&result_page=1&toukei=00600900&tstat=000001031111"
 )
-CACHE_SECONDS = 6 * 60 * 60
-START_DATE = pd.Timestamp("2020-01-01")
-GROQ_MODEL_DEFAULT = "openai/gpt-oss-20b"
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; HousingDashboard/1.0)"}
+TIMEOUT = 30
 
 
-def get_secret(name, default=""):
-    """Read a setting from Streamlit Secrets first, then environment variables."""
-    try:
-        value = st.secrets.get(name, default)
-    except Exception:
-        value = default
-    import os
-    return os.getenv(name, value) or default
+def fetch_latest_excel_url(list_url: str, required_words: list[str] | None = None) -> tuple[str, str]:
+    """Find an e-Stat Excel download link and its surrounding dataset label."""
+    response = requests.get(list_url, headers=HEADERS, timeout=TIMEOUT)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    candidates = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        label = " ".join(a.get_text(" ", strip=True).split())
+        if "file-download" not in href or "EXCEL" not in label.upper():
+            continue
+        parent = a
+        surrounding = ""
+        # Dataset title/date is usually in a parent container or table row.
+        for _ in range(5):
+            if parent.parent:
+                parent = parent.parent
+            surrounding = " ".join(parent.get_text(" ", strip=True).split())
+            if len(surrounding) > 30:
+                break
+        combined = f"{label} {surrounding}"
+        if required_words and not all(word in combined for word in required_words):
+            continue
+        url = urljoin("https://www.e-stat.go.jp", href)
+        candidates.append((url, surrounding))
+
+    if not candidates:
+        raise RuntimeError(
+            "e-Statの一覧ページからExcelダウンロードリンクを見つけられませんでした。"
+            "e-Stat側のページ構造が変更された可能性があります。"
+        )
+    return candidates[0]
 
 
-GROQ_API_KEY = get_secret("GROQ_API_KEY")
-GROQ_MODEL = get_secret("GROQ_MODEL", GROQ_MODEL_DEFAULT)
-
-PREFECTURE_ALIASES = {
-    "北海道": "北海道",
-    "青森": "青森県", "青森県": "青森県",
-    "岩手": "岩手県", "岩手県": "岩手県",
-    "宮城": "宮城県", "宮城県": "宮城県",
-    "秋田": "秋田県", "秋田県": "秋田県",
-    "山形": "山形県", "山形県": "山形県",
-    "福島": "福島県", "福島県": "福島県",
-    "茨城": "茨城県", "茨城県": "茨城県",
-    "栃木": "栃木県", "栃木県": "栃木県",
-    "群馬": "群馬県", "群馬県": "群馬県",
-    "埼玉": "埼玉県", "埼玉県": "埼玉県",
-    "千葉": "千葉県", "千葉県": "千葉県",
-    "東京": "東京都", "東京都": "東京都",
-    "神奈川": "神奈川県", "神奈川県": "神奈川県",
-    "新潟": "新潟県", "新潟県": "新潟県",
-    "富山": "富山県", "富山県": "富山県",
-    "石川": "石川県", "石川県": "石川県",
-    "福井": "福井県", "福井県": "福井県",
-    "山梨": "山梨県", "山梨県": "山梨県",
-    "長野": "長野県", "長野県": "長野県",
-    "岐阜": "岐阜県", "岐阜県": "岐阜県",
-    "静岡": "静岡県", "静岡県": "静岡県",
-    "愛知": "愛知県", "愛知県": "愛知県",
-    "三重": "三重県", "三重県": "三重県",
-    "滋賀": "滋賀県", "滋賀県": "滋賀県",
-    "京都": "京都府", "京都府": "京都府",
-    "大阪": "大阪府", "大阪府": "大阪府",
-    "兵庫": "兵庫県", "兵庫県": "兵庫県",
-    "奈良": "奈良県", "奈良県": "奈良県",
-    "和歌山": "和歌山県", "和歌山県": "和歌山県",
-    "鳥取": "鳥取県", "鳥取県": "鳥取県",
-    "島根": "島根県", "島根県": "島根県",
-    "岡山": "岡山県", "岡山県": "岡山県",
-    "広島": "広島県", "広島県": "広島県",
-    "山口": "山口県", "山口県": "山口県",
-    "徳島": "徳島県", "徳島県": "徳島県",
-    "香川": "香川県", "香川県": "香川県",
-    "愛媛": "愛媛県", "愛媛県": "愛媛県",
-    "高知": "高知県", "高知県": "高知県",
-    "福岡": "福岡県", "福岡県": "福岡県",
-    "佐賀": "佐賀県", "佐賀県": "佐賀県",
-    "長崎": "長崎県", "長崎県": "長崎県",
-    "熊本": "熊本県", "熊本県": "熊本県",
-    "大分": "大分県", "大分県": "大分県",
-    "宮崎": "宮崎県", "宮崎県": "宮崎県",
-    "鹿児島": "鹿児島県", "鹿児島県": "鹿児島県",
-    "沖縄": "沖縄県", "沖縄県": "沖縄県",
-}
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def download_excel(url: str) -> dict[str, pd.DataFrame]:
+    response = requests.get(url, headers=HEADERS, timeout=60)
+    response.raise_for_status()
+    content = response.content
+    if not content.startswith(b"PK"):
+        raise RuntimeError("e-StatからExcelファイルを取得できませんでした。")
+    workbook = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
+    return {str(name): df for name, df in workbook.items()}
 
 
-def normalize_text(value):
-    if value is None:
+def normalize_text(value) -> str:
+    if pd.isna(value):
         return ""
-    text = unicodedata.normalize("NFKC", str(value))
-    return re.sub(r"\s+", "", text).strip()
+    return re.sub(r"\s+", "", str(value)).replace("　", "")
 
 
-def number_or_none(value):
-    if value is None:
+def find_month(value):
+    """Convert common Japanese year/month representations into YYYY-MM."""
+    if pd.isna(value):
         return None
-    if isinstance(value, (int, float)):
-        if pd.isna(value):
-            return None
-        return int(value)
-    text = normalize_text(value).replace(",", "")
-    if not text or text in {"-", "－", "…", "－"}:
-        return None
-    try:
-        return int(float(text))
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_month_from_sheet(sheet):
-    # The report title is normally in the first several rows, e.g. 令和８年８月分...
-    pattern = re.compile(r"(令和|平成)\s*(元|\d+)年\s*(\d+)月")
-    for row_index in range(min(sheet.nrows, 12)):
-        for col_index in range(min(sheet.ncols, 8)):
-            value = sheet.cell_value(row_index, col_index)
-            if not isinstance(value, str):
-                continue
-            normalized = unicodedata.normalize("NFKC", value)
-            match = pattern.search(normalized)
-            if not match:
-                continue
-            era, year_text, month_text = match.groups()
-            era_year = 1 if year_text == "元" else int(year_text)
-            month = int(month_text)
-            year = (2018 + era_year) if era == "令和" else (1988 + era_year)
-            if 1 <= month <= 12:
-                return pd.Timestamp(year=year, month=month, day=1)
+    if isinstance(value, (pd.Timestamp, date)):
+        return pd.Timestamp(value).to_period("M").to_timestamp()
+    s = str(value).strip()
+    s = s.replace("年", "/").replace("月", "").replace("．", ".")
+    s = s.replace("年度", "年")
+    # Reiwa / Heisei era dates
+    era = re.search(r"(令和|平成)\s*(\d+)\s*年\s*(\d+)\s*月", s)
+    if era:
+        year = int(era.group(2)) + (2018 if era.group(1) == "令和" else 1988)
+        return pd.Timestamp(year=year, month=int(era.group(3)), day=1)
+    m = re.search(r"((?:19|20)\d{2})\s*[/\-\.]\s*(\d{1,2})", s)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return pd.Timestamp(year=int(m.group(1)), month=int(m.group(2)), day=1)
+    m = re.search(r"((?:19|20)\d{2})\s*年\s*(\d{1,2})", s)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return pd.Timestamp(year=int(m.group(1)), month=int(m.group(2)), day=1)
     return None
 
 
-def find_latest_workbook_url():
-    response = requests.get(
-        SOURCE_PAGE,
-        timeout=60,
-        headers={"User-Agent": "Mozilla/5.0 housing-dashboard/1.0"},
-    )
-    response.raise_for_status()
-    soup = BeautifulSoup(response.content, "html.parser")
+def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Parse e-Stat's prefecture-by-month Excel without assuming a fixed sheet layout.
+    The parser looks for a header row containing month-like values and prefecture labels.
+    """
+    pref_names = [
+        "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+        "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+        "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+        "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+        "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+        "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+        "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
+    ]
+    prefectures = set(pref_names)
+    results = []
 
-    for anchor in soup.find_all("a", href=True):
-        label = normalize_text(anchor.get_text(" ", strip=True))
-        if "都道府県別着工戸数" in label:
-            return urljoin(SOURCE_PAGE, anchor["href"])
-
-    raise RuntimeError(
-        "国土交通省の公式ページから「住宅 都道府県別着工戸数」のExcelリンクを"
-        "見つけられませんでした。公式ページのリンク名が変更された可能性があります。"
-    )
-
-
-@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
-def load_housing_data():
-    file_url = find_latest_workbook_url()
-    response = requests.get(
-        file_url,
-        timeout=120,
-        headers={"User-Agent": "Mozilla/5.0 housing-dashboard/1.0"},
-    )
-    response.raise_for_status()
-    file_bytes = response.content
-
-    if len(file_bytes) < 10_000:
-        raise RuntimeError(
-            "ダウンロードしたファイルのサイズが小さすぎます。"
-            "公式サイトがExcelではなくエラーページを返した可能性があります。"
-        )
-
-    workbook = xlrd.open_workbook(file_contents=file_bytes, on_demand=True)
-    rows = []
-    skipped_sheets = []
-
-    for sheet_name in workbook.sheet_names():
-        sheet = workbook.sheet_by_name(sheet_name)
-        month = parse_month_from_sheet(sheet)
-        if month is None or month < START_DATE:
+    for sheet_name, raw in sheets.items():
+        if raw is None or raw.empty:
             continue
-
-        prefecture_values = {}
-        national_value = None
-
-        # In the official workbook, prefecture names are in column B (index 1)
-        # and total new housing starts are in column C (index 2).
-        # This matches the attached kenbetu808.xls workbook.
-        for row_index in range(sheet.nrows):
-            if sheet.ncols < 3:
-                continue
-            label = normalize_text(sheet.cell_value(row_index, 1))
-            value = number_or_none(sheet.cell_value(row_index, 2))
-            if value is None:
+        df = raw.copy().fillna("")
+        max_rows = min(len(df), 35)
+        for header_idx in range(max_rows):
+            row = [normalize_text(v) for v in df.iloc[header_idx].tolist()]
+            month_cols = {}
+            for col_idx, value in enumerate(row):
+                month = find_month(value)
+                if month is not None:
+                    month_cols[col_idx] = month
+            if len(month_cols) < 3:
                 continue
 
-            if label == "合計":
-                national_value = value
-            elif label in PREFECTURE_ALIASES:
-                prefecture = PREFECTURE_ALIASES[label]
-                # Keep the first occurrence in case the sheet repeats a region.
-                prefecture_values.setdefault(prefecture, value)
+            # Determine likely prefecture-name column in the first several columns.
+            pref_col = None
+            for col_idx in range(min(6, df.shape[1])):
+                vals = {normalize_text(v) for v in df.iloc[header_idx + 1:, col_idx].tolist()}
+                if len(vals & prefectures) >= 5:
+                    pref_col = col_idx
+                    break
+            if pref_col is None:
+                continue
 
-        if len(prefecture_values) < 47:
-            skipped_sheets.append(
-                f"{sheet_name}（都道府県の取得数: {len(prefecture_values)}）"
-            )
-            continue
+            for row_idx in range(header_idx + 1, len(df)):
+                pref = normalize_text(df.iat[row_idx, pref_col])
+                if pref not in prefectures:
+                    continue
+                for col_idx, month in month_cols.items():
+                    if col_idx >= df.shape[1]:
+                        continue
+                    raw_value = df.iat[row_idx, col_idx]
+                    if raw_value == "" or pd.isna(raw_value):
+                        continue
+                    try:
+                        value = float(str(raw_value).replace(",", "").replace(" ", ""))
+                    except (ValueError, TypeError):
+                        continue
+                    results.append({
+                        "年月": month,
+                        "地域": pref,
+                        "指標": "住宅着工戸数",
+                        "値": value,
+                        "単位": "戸",
+                        "出典": "e-Stat 建築着工統計調査",
+                        "シート": sheet_name,
+                    })
+            if results:
+                break
 
-        rows.append(
-            {
-                "年月": month,
-                "地域": "全国",
-                "住宅着工戸数": national_value
-                if national_value is not None
-                else sum(prefecture_values.values()),
-            }
-        )
-        for prefecture, value in prefecture_values.items():
-            rows.append(
-                {
-                    "年月": month,
-                    "地域": prefecture,
-                    "住宅着工戸数": value,
-                }
-            )
-
-    workbook.release_resources()
-
-    df = pd.DataFrame(rows)
-    if df.empty:
+    if not results:
         raise RuntimeError(
-            "2020年1月以降の月次データを読み取れませんでした。"
-            "Excelのシート構成が変更された可能性があります。"
+            "Excelは取得できましたが、都道府県別の月次データを自動判定できませんでした。"
+            "e-StatのExcel表構成が想定と異なる可能性があります。"
         )
-
-    df = df.drop_duplicates(subset=["年月", "地域"], keep="last")
-    df = df.sort_values(["地域", "年月"]).reset_index(drop=True)
-
-    # YoY is calculated against the same month in the previous year.
-    df["前年同月戸数"] = df.groupby("地域")["住宅着工戸数"].shift(12)
-    df["前年同月比（％）"] = (
-        (df["住宅着工戸数"] / df["前年同月戸数"] - 1) * 100
-    ).where(df["前年同月戸数"] > 0)
-
-    latest_month = df["年月"].max()
-    return df, latest_month, file_url, skipped_sheets
+    out = pd.DataFrame(results).drop_duplicates(subset=["年月", "地域", "指標"])
+    return out.sort_values(["年月", "地域"]).reset_index(drop=True)
 
 
+def groq_analysis(data: pd.DataFrame, model: str, api_key: str) -> str:
+    from groq import Groq
+    client = Groq(api_key=api_key)
+    summary = (
+        data.groupby("年月", as_index=False)["値"].sum()
+        .sort_values("年月")
+        .tail(36)
+        .to_string(index=False)
+    )
+    prompt = (
+        "あなたは日本の住宅市場データを分析するアナリストです。"
+        "次の住宅着工戸数データに基づき、日本語で簡潔に分析してください。"
+        "長期傾向、直近の変化、解釈上の注意を分け、データにない原因を断定しないでください。\n\n"
+        f"{summary}"
+    )
+    response = client.chat.completions.create(
+        model=model or "openai/gpt-oss-20b",
+        messages=[
+            {"role": "system", "content": "数値に忠実で、根拠のない推測を避ける分析担当者です。"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return response.choices[0].message.content or "分析結果を取得できませんでした。"
+
+
+st.set_page_config(page_title="住宅着工統計ダッシュボード", page_icon="📊", layout="wide")
 st.title("住宅着工統計ダッシュボード")
-st.caption("出典：国土交通省「建築着工統計調査報告 時系列一覧」")
-st.caption("対象：2020年1月〜最新公表月／新設住宅着工戸数")
+st.caption("e-Statの公開Excelを自動取得して表示します。データ取得元：総務省統計局・国土交通省 e-Stat")
+
+with st.sidebar:
+    st.header("データ・表示設定")
+    st.write("データはe-Statの公開Excelから自動取得します。")
+    refresh = st.button("データを再取得", use_container_width=True)
+    if refresh:
+        st.cache_data.clear()
+        st.rerun()
 
 try:
-    with st.spinner("国土交通省の最新Excelを確認し、月次データを読み込んでいます..."):
-        df, latest_month, source_url, skipped_sheets = load_housing_data()
+    with st.spinner("e-Statから最新のExcelを取得しています..."):
+        excel_url, dataset_label = fetch_latest_excel_url(
+            ESTAT_HOUSING_LIST_URL, required_words=["都道府県別着工戸数"]
+        )
+        workbook = download_excel(excel_url)
+        data = parse_prefecture_timeseries(workbook)
 except Exception as exc:
-    st.error(f"データ取得に失敗しました：{exc}")
-    st.markdown(f"[国土交通省の公式時系列一覧を開く]({SOURCE_PAGE})")
+    st.error("e-Statデータを読み込めませんでした。")
+    st.code(str(exc))
+    st.markdown(
+        f"データ掲載ページ：[{ESTAT_HOUSING_LIST_URL}]({ESTAT_HOUSING_LIST_URL})"
+    )
     st.stop()
 
-national = df[df["地域"] == "全国"].sort_values("年月")
-prefectures = df[df["地域"] != "全国"].copy()
-latest_pref = prefectures[prefectures["年月"] == latest_month].copy()
-latest_national = national[national["年月"] == latest_month]
+data["年月"] = pd.to_datetime(data["年月"])
+min_date = data["年月"].min().date()
+max_date = data["年月"].max().date()
 
-if latest_national.empty:
-    st.warning("最新月の全国計が見つかりません。")
-    latest_total = None
-    latest_yoy = None
+with st.sidebar:
+    start_date = st.date_input("開始月", value=min_date, min_value=min_date, max_value=max_date)
+    end_date = st.date_input("終了月", value=max_date, min_value=min_date, max_value=max_date)
+    all_regions = sorted(data["地域"].unique().tolist())
+    selected_regions = st.multiselect("都道府県", all_regions, default=all_regions)
+    chart_type = st.selectbox("グラフ形式", ["折れ線", "棒", "面"])
+    show_table = st.checkbox("データ表を表示", value=True)
+
+filtered = data[
+    (data["年月"].dt.date >= start_date)
+    & (data["年月"].dt.date <= end_date)
+    & (data["地域"].isin(selected_regions))
+].copy()
+
+if filtered.empty:
+    st.warning("指定した条件に該当するデータがありません。")
+    st.stop()
+
+latest_month = filtered["年月"].max()
+latest_total = filtered.loc[filtered["年月"] == latest_month, "値"].sum()
+previous_months = sorted(filtered["年月"].unique())
+previous_total = None
+if len(previous_months) >= 2:
+    previous_total = filtered.loc[filtered["年月"] == previous_months[-2], "値"].sum()
+
+c1, c2, c3 = st.columns(3)
+c1.metric("表示対象の最新月", latest_month.strftime("%Y年%m月"))
+c2.metric("最新月の合計", f"{latest_total:,.0f} 戸")
+if previous_total is not None:
+    delta = latest_total - previous_total
+    c3.metric("前月比（表示地域合計）", f"{delta:+,.0f} 戸")
 else:
-    latest_total = int(latest_national.iloc[0]["住宅着工戸数"])
-    latest_yoy = latest_national.iloc[0]["前年同月比（％）"]
+    c3.metric("対象都道府県数", f"{filtered['地域'].nunique()}")
 
-metric1, metric2, metric3, metric4 = st.columns(4)
-metric1.metric("最新公表月", latest_month.strftime("%Y年%m月"))
-metric2.metric("全国の住宅着工戸数", f"{latest_total:,}戸" if latest_total is not None else "—")
-metric3.metric(
-    "全国・前年同月比",
-    f"{latest_yoy:+.1f}%" if pd.notna(latest_yoy) else "—",
-)
-metric4.metric("取得期間", f"{national['年月'].min():%Y年%m月}〜{latest_month:%Y年%m月}")
-
-st.subheader("全国の月次推移")
-fig_national = px.line(
-    national,
-    x="年月",
-    y="住宅着工戸数",
-    markers=True,
-    labels={"年月": "年月", "住宅着工戸数": "住宅着工戸数（戸）"},
-)
-fig_national.update_layout(xaxis_title="年月", yaxis_title="住宅着工戸数（戸）")
-st.plotly_chart(fig_national, use_container_width=True)
-
-st.subheader("地域別の月次推移")
-available_regions = ["全国"] + sorted(prefectures["地域"].unique().tolist())
-default_region_index = available_regions.index("東京都") if "東京都" in available_regions else 0
-selected_region = st.selectbox(
-    "地域を選択",
-    available_regions,
-    index=default_region_index,
-)
-region_df = df[df["地域"] == selected_region].sort_values("年月")
-fig_region = px.line(
-    region_df,
-    x="年月",
-    y="住宅着工戸数",
-    markers=True,
-    labels={"年月": "年月", "住宅着工戸数": "住宅着工戸数（戸）"},
-    title=f"{selected_region}の住宅着工戸数",
-)
-fig_region.update_layout(xaxis_title="年月", yaxis_title="住宅着工戸数（戸）")
-st.plotly_chart(fig_region, use_container_width=True)
-
-st.subheader("最新月の都道府県別比較")
-latest_pref = latest_pref.sort_values("住宅着工戸数", ascending=False)
-fig_pref = px.bar(
-    latest_pref,
-    x="地域",
-    y="住宅着工戸数",
-    labels={"地域": "都道府県", "住宅着工戸数": "住宅着工戸数（戸）"},
-)
-fig_pref.update_layout(xaxis_title="都道府県", yaxis_title="住宅着工戸数（戸）")
-st.plotly_chart(fig_pref, use_container_width=True)
-
-st.dataframe(
-    latest_pref[["地域", "住宅着工戸数", "前年同月比（％）"]].rename(
-        columns={"地域": "都道府県"}
-    ).assign(
-        **{
-            "前年同月比（％）": lambda x: x["前年同月比（％）"].round(1)
-        }
-    ),
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.subheader("AIによる分析（Groq）")
-if not GROQ_API_KEY:
-    st.info(
-        "AI分析を利用するには、Streamlit Community Cloudのアプリ設定で "
-        "Secrets に GROQ_API_KEY を設定してください。"
-    )
-    st.markdown("[Groq APIキーの管理画面を開く](https://console.groq.com/keys)")
+st.subheader("住宅着工戸数の推移")
+if chart_type == "棒":
+    fig = px.bar(filtered, x="年月", y="値", color="地域", barmode="group", labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
+elif chart_type == "面":
+    fig = px.area(filtered, x="年月", y="値", color="地域", labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
 else:
-    st.caption(
-        "表示中の統計データをGroqで分析します。"
-        "分析結果は参考情報であり、原因を断定するものではありません。"
-    )
-    if st.button("住宅着工統計をAIで分析", type="primary"):
+    fig = px.line(filtered, x="年月", y="値", color="地域", markers=True, labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
+fig.update_layout(legend_title_text="都道府県", xaxis_title="年月", yaxis_title="住宅着工戸数（戸）")
+st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("最新月の都道府県比較")
+latest = filtered[filtered["年月"] == latest_month].sort_values("値", ascending=False)
+bar = px.bar(latest, x="地域", y="値", labels={"地域": "都道府県", "値": "住宅着工戸数（戸）"})
+bar.update_layout(xaxis_title="", yaxis_title="住宅着工戸数（戸）")
+st.plotly_chart(bar, use_container_width=True)
+
+if show_table:
+    st.subheader("データ一覧")
+    display = filtered.sort_values(["年月", "地域"], ascending=[False, True]).copy()
+    display["年月"] = display["年月"].dt.strftime("%Y-%m")
+    st.dataframe(display[["年月", "地域", "値", "単位", "出典"]], use_container_width=True, hide_index=True)
+
+csv_data = filtered.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+st.download_button(
+    "表示データをCSVでダウンロード",
+    data=csv_data,
+    file_name="housing_starts_estat.csv",
+    mime="text/csv",
+)
+
+with st.expander("データ取得情報"):
+    st.write("取得先：e-Stat「住宅着工統計 / 時系列表 / 都道府県別着工戸数」")
+    st.write("ExcelダウンロードURL：", excel_url)
+    st.write("検出したデータセット情報：", dataset_label)
+    st.write("対象期間：", min_date, "～", max_date)
+    st.caption("e-Statの公開Excelの表構成が変更された場合、読み取り処理の調整が必要になることがあります。")
+
+st.subheader("AIによる傾向分析")
+try:
+    groq_key = st.secrets.get("GROQ_API_KEY", "")
+    groq_model = st.secrets.get("GROQ_MODEL", "openai/gpt-oss-20b")
+except Exception:
+    groq_key = ""
+    groq_model = "openai/gpt-oss-20b"
+
+if not groq_key:
+    st.info("AI分析を使う場合は、Streamlit Cloud の App settings → Secrets に GROQ_API_KEY を設定してください。")
+else:
+    if st.button("表示データをAI分析する"):
         try:
-            # Send a compact summary rather than the entire dataset.
-            recent_national = national.tail(36).copy()
-            recent_national["年月"] = recent_national["年月"].dt.strftime("%Y-%m")
-            national_records = recent_national[
-                ["年月", "住宅着工戸数", "前年同月比（％）"]
-            ].where(pd.notna(recent_national[
-                ["年月", "住宅着工戸数", "前年同月比（％）"]
-            ]), None).to_dict(orient="records")
-
-            recent_region = region_df.tail(36).copy()
-            recent_region["年月"] = recent_region["年月"].dt.strftime("%Y-%m")
-            region_records = recent_region[
-                ["年月", "住宅着工戸数", "前年同月比（％）"]
-            ].where(pd.notna(recent_region[
-                ["年月", "住宅着工戸数", "前年同月比（％）"]
-            ]), None).to_dict(orient="records")
-
-            comparison = latest_pref[
-                ["地域", "住宅着工戸数", "前年同月比（％）"]
-            ].copy()
-            comparison["前年同月比（％）"] = comparison["前年同月比（％）"].round(1)
-            comparison_records = comparison.head(10).where(
-                pd.notna(comparison.head(10)), None
-            ).to_dict(orient="records")
-
-            prompt_data = {
-                "最新公表月": latest_month.strftime("%Y-%m"),
-                "分析対象地域": selected_region,
-                "全国直近36か月": national_records,
-                "選択地域直近36か月": region_records,
-                "最新月の都道府県別着工戸数上位10": comparison_records,
-            }
-
-            client = Groq(api_key=GROQ_API_KEY, timeout=60.0)
-            completion = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "あなたは日本の住宅着工統計を分析するアナリストです。"
-                            "必ず日本語で回答してください。"
-                            "提供された数値だけを根拠に、観察できる傾向、"
-                            "前年同月比の動き、地域差、今後確認したい点を整理してください。"
-                            "データにない数値を作らず、因果関係は断定せず、"
-                            "推測は推測と明記してください。"
-                            "見出しと箇条書きを使い、読みやすく簡潔に説明してください。"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "次の住宅着工統計を分析してください。\n\n"
-                            + json.dumps(prompt_data, ensure_ascii=False, default=str)
-                        ),
-                    },
-                ],
-                temperature=0.2,
-                max_completion_tokens=2500,
-            )
-            analysis_text = completion.choices[0].message.content
-            if analysis_text:
-                st.markdown(analysis_text)
-            else:
-                st.warning("AIから空の回答が返されました。もう一度お試しください。")
+            with st.spinner("AIがデータを分析しています..."):
+                st.write(groq_analysis(filtered, groq_model, groq_key))
         except Exception as exc:
-            st.error(
-                "AI分析に失敗しました。Groq APIキー、モデル名、"
-                f"利用上限を確認してください。詳細：{exc}"
-            )
-
-with st.expander("取得データ・更新情報"):
-    st.write(f"データ最終月：{latest_month:%Y年%m月}")
-    st.write(f"キャッシュ有効期間：{CACHE_SECONDS // 3600}時間")
-    st.write(f"取得元Excel：[ダウンロード元を開く]({source_url})")
-    st.write(f"対象データ件数：{len(df):,}行（全国＋都道府県）")
-    if skipped_sheets:
-        st.warning("一部のシートを読み飛ばしました。")
-        st.write(skipped_sheets)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-st.caption(
-    "注：最新データは国土交通省の公表状況に依存します。"
-    "キャッシュ有効期間は6時間です。"
-)
+            st.error(f"AI分析に失敗しました: {exc}")
