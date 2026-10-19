@@ -311,95 +311,135 @@ def row_month(row, inherited_year=None):
     return None
 
 
+def parse_month_from_sheet(sheet_name: str, df: pd.DataFrame):
+    """Get the reporting month from the report title or sheet name."""
+    import unicodedata
+
+    # The workbook's visible title normally includes e.g. 令和８年８月分.
+    candidates = [str(sheet_name)]
+    for row_idx in range(min(8, len(df))):
+        for value in df.iloc[row_idx].tolist():
+            if value is not None and str(value).strip():
+                candidates.append(str(value))
+
+    for candidate in candidates:
+        text = unicodedata.normalize("NFKC", candidate).replace(" ", "")
+
+        # Japanese era year/month: Reiwa 8 = Gregorian 2026.
+        match = re.search(r"(令和|平成|昭和)\s*(元|\d+)年\s*(\d{1,2})月", text)
+        if match:
+            era, era_year_text, month_text = match.groups()
+            era_year = 1 if era_year_text == "元" else int(era_year_text)
+            base_year = {"令和": 2018, "平成": 1988, "昭和": 1925}[era]
+            month = int(month_text)
+            if 1 <= month <= 12:
+                return pd.Timestamp(year=base_year + era_year, month=month, day=1)
+
+        # Western year/month, should an updated workbook use that notation.
+        match = re.search(r"((?:19|20)\d{2})年\s*(\d{1,2})月", text)
+        if match:
+            year, month = int(match.group(1)), int(match.group(2))
+            if 1 <= month <= 12:
+                return pd.Timestamp(year=year, month=month, day=1)
+
+    return None
+
+
+def find_total_count_column(df: pd.DataFrame, prefecture_col: int) -> int:
+    """Find the primary-table column labelled 総数 / 戸数, avoiding the auxiliary table."""
+    scan_rows = min(8, len(df))
+    scan_cols = min(18, df.shape[1])  # the primary table is at the left of the worksheet
+    for col_idx in range(scan_cols):
+        has_total = any(clean_text(df.iat[row_idx, col_idx]) == "総数" for row_idx in range(scan_rows))
+        has_count = any(clean_text(df.iat[row_idx, col_idx]) == "戸数" for row_idx in range(scan_rows))
+        if has_total and has_count:
+            return col_idx
+
+    # In the observed e-Stat layout, total starts immediately to the right of the prefecture.
+    fallback = prefecture_col + 1
+    if fallback < df.shape[1]:
+        return fallback
+    raise RuntimeError("住宅着工戸数（総数）の列を特定できませんでした。")
+
+
 def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Parse the actual e-Stat workbook layout shown in the monthly '利用関係別・都道府県別表':
+      - one worksheet per reporting month
+      - prefectures listed vertically in column B (index 1)
+      - total housing starts in column C (index 2)
+      - report month found in the title, e.g. 令和８年８月分
+    """
     records = []
+    sheet_debug = []
 
     for sheet_name, raw in sheets.items():
         if raw is None or raw.empty:
             continue
         df = raw.copy().reset_index(drop=True)
+
+        # Normalize text cells only, without DataFrame.applymap (removed in recent pandas).
         df = df.apply(lambda column: column.map(lambda x: x.strip() if isinstance(x, str) else x))
+        month = parse_month_from_sheet(sheet_name, df)
+        if month is None:
+            sheet_debug.append(f"シート「{sheet_name}」: タイトル・シート名から年月を特定できません")
+            continue
 
-        # Orientation A: prefectures are row labels; months are column headers.
-        date_cols = month_headers_for_columns(df)
-        pref_col_candidates = []
+        # Detect the prefecture column in the left-side main table.
+        prefecture_candidates = []
         for col_idx in range(min(8, df.shape[1])):
-            pref_hits = get_pref_cells_in_col(df, col_idx)
-            if len(pref_hits) >= 5:
-                pref_col_candidates.append((col_idx, pref_hits))
-        if date_cols and pref_col_candidates:
-            pref_col, pref_rows = max(pref_col_candidates, key=lambda item: len(item[1]))
-            for row_idx, pref in pref_rows.items():
-                for col_idx, month in date_cols.items():
-                    if row_idx >= df.shape[0] or col_idx >= df.shape[1]:
-                        continue
-                    value = numeric_value(df.iat[row_idx, col_idx])
-                    if value is None:
-                        continue
-                    records.append({
-                        "年月": month, "地域": pref, "指標": "住宅着工戸数",
-                        "値": value, "単位": "戸", "出典": "e-Stat 建築着工統計調査",
-                        "シート": sheet_name,
-                    })
-            if records:
-                continue
+            hits = get_pref_cells_in_col(df, col_idx)
+            if len(hits) >= 10:
+                prefecture_candidates.append((col_idx, hits))
+        if not prefecture_candidates:
+            sheet_debug.append(f"シート「{sheet_name}」: 都道府県名の列を特定できません")
+            continue
+        prefecture_col, prefecture_rows = max(prefecture_candidates, key=lambda item: len(item[1]))
 
-        # Orientation B: prefectures are column headers; months are row labels.
-        pref_header_candidates = []
-        for row_idx in range(min(45, df.shape[0])):
-            pref_cells = get_pref_cells_in_row(df, row_idx)
-            if len(pref_cells) >= 5:
-                pref_header_candidates.append((row_idx, pref_cells))
-        if pref_header_candidates:
-            header_row, pref_cols = max(pref_header_candidates, key=lambda item: len(item[1]))
-            inherited_year = None
-            for row_idx in range(header_row + 1, df.shape[0]):
-                row = df.iloc[row_idx].tolist()
-                # If a standalone year row appears, carry it forward for month-only rows.
-                flat = " ".join(str(value) for value in row[:min(6, len(row))])
-                year_match = re.search(r"((?:19|20)\d{2})\s*年?", flat)
-                era_match = re.search(r"(令和|平成|昭和)\s*(\d+)", flat)
-                short_match = re.search(r"\b([RHS])\s*(\d{1,2})\b", flat, re.I)
-                if year_match:
-                    inherited_year = int(year_match.group(1))
-                elif era_match:
-                    inherited_year = {"令和": 2018, "平成": 1988, "昭和": 1925}[era_match.group(1)] + int(era_match.group(2))
-                elif short_match:
-                    inherited_year = {"R": 2018, "H": 1988, "S": 1925}[short_match.group(1).upper()] + int(short_match.group(2))
+        try:
+            total_col = find_total_count_column(df, prefecture_col)
+        except RuntimeError as exc:
+            sheet_debug.append(f"シート「{sheet_name}」: {exc}")
+            continue
 
-                month = row_month(row, inherited_year)
-                if month is None:
-                    continue
-                for col_idx, pref in pref_cols.items():
-                    if col_idx >= len(row):
-                        continue
-                    value = numeric_value(row[col_idx])
-                    if value is None:
-                        continue
-                    records.append({
-                        "年月": month, "地域": pref, "指標": "住宅着工戸数",
-                        "値": value, "単位": "戸", "出典": "e-Stat 建築着工統計調査",
-                        "シート": sheet_name,
-                    })
-            if records:
+        rows_added = 0
+        for row_idx, prefecture in prefecture_rows.items():
+            if row_idx >= df.shape[0] or total_col >= df.shape[1]:
                 continue
+            value = numeric_value(df.iat[row_idx, total_col])
+            if value is None:
+                continue
+            records.append({
+                "年月": month,
+                "地域": prefecture,
+                "指標": "住宅着工戸数",
+                "値": value,
+                "単位": "戸",
+                "出典": "e-Stat 建築着工統計調査",
+                "シート": str(sheet_name),
+            })
+            rows_added += 1
+        if rows_added == 0:
+            sheet_debug.append(
+                f"シート「{sheet_name}」: 都道府県は検出しましたが、着工戸数の数値がありません"
+            )
 
     if not records:
-        sheet_descriptions = []
-        for name, df in sheets.items():
-            if df is None:
-                continue
-            preview = df.head(6).fillna("").astype(str).values.tolist()
-            sheet_descriptions.append(f"シート「{name}」の先頭6行: {preview}")
+        previews = []
+        for name, df in list(sheets.items())[:3]:
+            if df is not None:
+                preview = df.head(6).fillna("").astype(str).values.tolist()
+                previews.append(f"シート「{name}」の先頭6行: {preview}")
+        diagnostic = "\n".join(sheet_debug[:10] + previews)
         raise RuntimeError(
-            "Excelファイルは取得できましたが、都道府県と年月の配置を判定できませんでした。\n"
-            + "\n".join(sheet_descriptions[:4])
+            "Excelファイルは取得できましたが、都道府県別の住宅着工戸数を抽出できませんでした。\n"
+            + diagnostic
         )
 
     result = pd.DataFrame(records)
     result["年月"] = pd.to_datetime(result["年月"])
-    result = result.drop_duplicates(subset=["年月", "地域", "指標"])
-    # The workbook can contain multiple series/sheets; retain positive, valid numeric rows.
+    # A single prefecture/month should have only one value; discard duplicate sheet rows.
+    result = result.drop_duplicates(subset=["年月", "地域", "指標"], keep="first")
     result = result[result["値"].notna()]
     result = result.sort_values(["年月", "地域"]).reset_index(drop=True)
     return result
