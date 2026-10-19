@@ -225,20 +225,41 @@ def normalize_pref_name(value) -> str:
 
 
 def match_prefecture(value):
-    """Return prefecture name for an exact cell or a cell with a harmless suffix/code."""
+    """
+    Return the canonical prefecture name for a cell in e-Stat Excel.
+
+    The main table may write prefecture labels with or without the suffix 県/府/都
+    (for example, 青森県 or 青森). Some related tables also include a leading
+    five-digit regional code (for example, 02000青森), so support those forms too.
+    """
     text = normalize_pref_name(value)
     if not text:
         return None
+
+    # Remove common leading statistical area codes, e.g. 02000青森 or 02 青森.
+    text = re.sub(r"^[0-9０-９]{1,5}", "", text)
+    text = re.sub(r"^[(（]?[0-9０-９]{1,5}[)）]?", "", text)
+    text = re.sub(r"^[：:_-]+", "", text)
+
+    # Build aliases while always returning the canonical full prefecture name.
     for pref in PREFECTURES:
-        if text == normalize_pref_name(pref):
+        canonical = normalize_pref_name(pref)
+        aliases = {canonical}
+
+        # e-Stat tables sometimes abbreviate 青森県 -> 青森, 東京都 -> 東京, etc.
+        if pref.endswith(("県", "府", "都")):
+            aliases.add(normalize_pref_name(pref[:-1]))
+
+        if text in aliases:
             return pref
-    # A few spreadsheet exports append a prefecture code/comment in the same cell.
-    for pref in PREFECTURES:
-        normalized_pref = normalize_pref_name(pref)
-        if text.startswith(normalized_pref):
-            suffix = text[len(normalized_pref):]
-            if re.fullmatch(r"[0-9０-９()（）:：._-]*", suffix):
-                return pref
+
+        # Allow only safe trailing codes/markers after a recognized name.
+        for alias in aliases:
+            if text.startswith(alias):
+                suffix = text[len(alias):]
+                if re.fullmatch(r"[0-9０-９()（）:：._-]*", suffix):
+                    return pref
+
     return None
 
 
@@ -396,7 +417,7 @@ def find_total_count_column(df: pd.DataFrame, prefecture_col: int) -> int:
 
 
 def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Parse e-Stat workbook: one worksheet per month, prefecture in column B, total in C."""
+    """Parse e-Stat workbook: one worksheet per month, prefecture labels in column B, total in C."""
     records = []
     sheet_debug = []
 
@@ -421,7 +442,7 @@ def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame
 
         if not prefecture_candidates:
             # The observed e-Stat table places prefecture names in column B (index 1).
-            # Explicitly retry this known column before declaring extraction failure.
+            # Retry the known prefecture column explicitly before declaring extraction failure.
             if df.shape[1] > 1:
                 fallback_hits = get_pref_cells_in_col(df, 1)
                 if fallback_hits:
