@@ -318,7 +318,7 @@ def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame
         if raw is None or raw.empty:
             continue
         df = raw.copy().reset_index(drop=True)
-        df = df.applymap(lambda x: x if not isinstance(x, str) else x.strip())
+        df = df.apply(lambda column: column.map(lambda x: x.strip() if isinstance(x, str) else x))
 
         # Orientation A: prefectures are row labels; months are column headers.
         date_cols = month_headers_for_columns(df)
