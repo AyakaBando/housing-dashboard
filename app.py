@@ -1,196 +1,411 @@
 import io
 import re
-from datetime import date
+from datetime import date, datetime
 from urllib.parse import urljoin
 
 import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
-import plotly.express as px
 from bs4 import BeautifulSoup
 
-# e-Stat official dataset page for monthly housing starts by prefecture.
+# The e-Stat monthly timeseries list. "layout=dataset" is used by the current listing.
 ESTAT_HOUSING_LIST_URL = (
     "https://www.e-stat.go.jp/stat-search/files"
-    "?cycle=1&kikan=00600&layout=dataset&"
-    "tclass1=000001048390&tclass2val=0&toukei=00600120&tstat=000001016966"
+    "?layout=dataset&tclass1=000001048390&toukei=00600120&tstat=000001016966"
 )
-ESTAT_RENOVATION_LIST_URL = (
-    "https://www.e-stat.go.jp/stat-search/files"
-    "?kikan=00600&layout=dataset&result_page=1&toukei=00600900&tstat=000001031111"
-)
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; HousingDashboard/1.0)"}
-TIMEOUT = 30
+PREFECTURES = [
+    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+    "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+    "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+    "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+    "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
+]
+PREF_SET = set(PREFECTURES)
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+    ),
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+}
+TIMEOUT = 45
 
 
-def fetch_latest_excel_url(list_url: str, required_words: list[str] | None = None) -> tuple[str, str]:
-    """Find an e-Stat Excel download link and its surrounding dataset label."""
-    response = requests.get(list_url, headers=HEADERS, timeout=TIMEOUT)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    candidates = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        label = " ".join(a.get_text(" ", strip=True).split())
-        if "file-download" not in href or "EXCEL" not in label.upper():
-            continue
-        parent = a
-        surrounding = ""
-        # Dataset title/date is usually in a parent container or table row.
-        for _ in range(5):
-            if parent.parent:
-                parent = parent.parent
-            surrounding = " ".join(parent.get_text(" ", strip=True).split())
-            if len(surrounding) > 30:
-                break
-        combined = f"{label} {surrounding}"
-        if required_words and not all(word in combined for word in required_words):
-            continue
-        url = urljoin("https://www.e-stat.go.jp", href)
-        candidates.append((url, surrounding))
-
-    if not candidates:
-        raise RuntimeError(
-            "e-Statの一覧ページからExcelダウンロードリンクを見つけられませんでした。"
-            "e-Stat側のページ構造が変更された可能性があります。"
-        )
-    return candidates[0]
-
-
-@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
-def download_excel(url: str) -> dict[str, pd.DataFrame]:
-    response = requests.get(url, headers=HEADERS, timeout=60)
-    response.raise_for_status()
-    content = response.content
-    if not content.startswith(b"PK"):
-        raise RuntimeError("e-StatからExcelファイルを取得できませんでした。")
-    workbook = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
-    return {str(name): df for name, df in workbook.items()}
-
-
-def normalize_text(value) -> str:
-    if pd.isna(value):
+def clean_text(value) -> str:
+    if value is None:
         return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
     return re.sub(r"\s+", "", str(value)).replace("　", "")
 
 
-def find_month(value):
-    """Convert common Japanese year/month representations into YYYY-MM."""
-    if pd.isna(value):
+def fetch_excel_link() -> tuple[str, str]:
+    """
+    Find the Excel download link associated with the exact e-Stat table title.
+    The title and download link are siblings on e-Stat, so search for their
+    nearest common ancestor instead of matching the whole page or the link alone.
+    """
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    response = session.get(ESTAT_HOUSING_LIST_URL, timeout=TIMEOUT)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    title_links = []
+    for anchor in soup.find_all("a", href=True):
+        label = clean_text(anchor.get_text(" ", strip=True))
+        if "都道府県別着工戸数" in label:
+            title_links.append(anchor)
+
+    for title_anchor in title_links:
+        parent = title_anchor
+        # The closest ancestor that contains both the table title and its Excel link wins.
+        for _ in range(9):
+            parent = parent.parent
+            if parent is None:
+                break
+            text = clean_text(parent.get_text(" ", strip=True))
+            if "都道府県別着工戸数" not in text:
+                continue
+            excel_links = []
+            for anchor in parent.find_all("a", href=True):
+                href = anchor.get("href", "")
+                label = clean_text(anchor.get_text(" ", strip=True)).upper()
+                if "file-download" in href and ("EXCEL" in label or "XLS" in label):
+                    excel_links.append(anchor)
+            if len(excel_links) == 1:
+                file_url = urljoin("https://www.e-stat.go.jp", excel_links[0]["href"])
+                return file_url, text[:700]
+            # Sometimes the immediate wrapper contains multiple links; select the
+            # Excel link only if this wrapper is still a reasonably small block.
+            if len(excel_links) > 1 and len(text) < 1600:
+                chosen = excel_links[0]
+                file_url = urljoin("https://www.e-stat.go.jp", chosen["href"])
+                return file_url, text[:700]
+
+    # Fallback: locate the title's page/statInfId, then look nearby in the HTML source
+    # for the download link that has the same title block.
+    raise RuntimeError(
+        "e-Statのページにはアクセスできましたが、"
+        "「〖住宅〗都道府県別着工戸数」に対応するExcelリンクを特定できませんでした。"
+        " e-Statのページ構造が変更された可能性があります。"
+    )
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def download_workbook(file_url: str) -> dict[str, pd.DataFrame]:
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    response = session.get(file_url, timeout=90)
+    response.raise_for_status()
+    body = response.content
+
+    # XLSX is a ZIP archive and starts with PK. This check avoids passing an HTML
+    # error/login page to pandas, which would produce a misleading Excel error.
+    if not body.startswith(b"PK"):
+        content_type = response.headers.get("content-type", "不明")
+        preview = response.text[:240].replace("\n", " ") if body else "(空の応答)"
+        raise RuntimeError(
+            "e-StatのExcelリンクからExcelファイルが返されませんでした。"
+            f" Content-Type={content_type}; 応答={preview}"
+        )
+
+    try:
+        sheets = pd.read_excel(io.BytesIO(body), sheet_name=None, header=None, engine="openpyxl")
+    except Exception as exc:
+        raise RuntimeError(f"ダウンロードしたファイルをExcelとして読み込めませんでした: {exc}") from exc
+    return {str(name): frame for name, frame in sheets.items()}
+
+
+def parse_month(value):
+    """Parse Japanese/Western year-month labels, returning the first day of the month."""
+    if value is None:
         return None
-    if isinstance(value, (pd.Timestamp, date)):
-        return pd.Timestamp(value).to_period("M").to_timestamp()
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        try:
+            return pd.Timestamp(value).to_period("M").to_timestamp()
+        except Exception:
+            return None
+
     s = str(value).strip()
-    s = s.replace("年", "/").replace("月", "").replace("．", ".")
-    s = s.replace("年度", "年")
-    # Reiwa / Heisei era dates
-    era = re.search(r"(令和|平成)\s*(\d+)\s*年\s*(\d+)\s*月", s)
+    if not s or s.lower() in {"nan", "nat", "none"}:
+        return None
+    s = s.replace("　", " ").strip()
+
+    # Japanese era formats.
+    era = re.search(r"(令和|平成|昭和)\s*(\d+)\s*年?\s*[/年.\-]\s*(\d{1,2})\s*月?", s)
     if era:
-        year = int(era.group(2)) + (2018 if era.group(1) == "令和" else 1988)
-        return pd.Timestamp(year=year, month=int(era.group(3)), day=1)
-    m = re.search(r"((?:19|20)\d{2})\s*[/\-\.]\s*(\d{1,2})", s)
-    if m and 1 <= int(m.group(2)) <= 12:
-        return pd.Timestamp(year=int(m.group(1)), month=int(m.group(2)), day=1)
-    m = re.search(r"((?:19|20)\d{2})\s*年\s*(\d{1,2})", s)
-    if m and 1 <= int(m.group(2)) <= 12:
-        return pd.Timestamp(year=int(m.group(1)), month=int(m.group(2)), day=1)
+        base = {"令和": 2018, "平成": 1988, "昭和": 1925}[era.group(1)]
+        year, month = base + int(era.group(2)), int(era.group(3))
+        if 1 <= month <= 12:
+            return pd.Timestamp(year=year, month=month, day=1)
+
+    # R8.4 / H31.4 / S63.4 patterns.
+    era_short = re.search(r"\b([RHS])\s*(\d{1,2})\s*[./\-年]\s*(\d{1,2})\s*月?\b", s, re.I)
+    if era_short:
+        base = {"R": 2018, "H": 1988, "S": 1925}[era_short.group(1).upper()]
+        year, month = base + int(era_short.group(2)), int(era_short.group(3))
+        if 1 <= month <= 12:
+            return pd.Timestamp(year=year, month=month, day=1)
+
+    # YYYY年M月, YYYY/M, YYYY-M, YYYY.M, and YYYYMM.
+    patterns = [
+        r"((?:19|20)\d{2})\s*年\s*(\d{1,2})\s*月",
+        r"((?:19|20)\d{2})\s*[/.\-]\s*(\d{1,2})(?:\D|$)",
+        r"\b((?:19|20)\d{2})(\d{2})\b",
+    ]
+    for index, pattern in enumerate(patterns):
+        match = re.search(pattern, s)
+        if not match:
+            continue
+        year, month = int(match.group(1)), int(match.group(2))
+        if index == 2 and not 1 <= month <= 12:
+            continue
+        if 1 <= month <= 12:
+            return pd.Timestamp(year=year, month=month, day=1)
+    return None
+
+
+def numeric_value(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().replace(",", "").replace("，", "").replace(" ", "")
+    if not s or s in {"-", "－", "…", "x", "X", "―"}:
+        return None
+    # Parentheses are commonly used in Excel for negative values.
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_pref_cells_in_row(df, row_idx):
+    return {
+        col_idx: clean_text(value)
+        for col_idx, value in enumerate(df.iloc[row_idx].tolist())
+        if clean_text(value) in PREF_SET
+    }
+
+
+def get_pref_cells_in_col(df, col_idx):
+    return {
+        row_idx: clean_text(value)
+        for row_idx, value in enumerate(df.iloc[:, col_idx].tolist())
+        if clean_text(value) in PREF_SET
+    }
+
+
+def month_headers_for_columns(df, max_rows=35):
+    """
+    Return column_index -> month for one horizontal month header.
+    Also supports a two-row header where years are above month numbers.
+    """
+    search_rows = min(max_rows, len(df))
+    best = {}
+
+    # First, find rows that explicitly contain dates.
+    for row_idx in range(search_rows):
+        found = {}
+        for col_idx, value in enumerate(df.iloc[row_idx].tolist()):
+            month = parse_month(value)
+            if month is not None:
+                found[col_idx] = month
+        if len(found) > len(best):
+            best = found
+    if len(best) >= 3:
+        return best
+
+    # Then, try a year row followed by a month row, filling merged year cells across.
+    for year_row in range(search_rows - 1):
+        years = []
+        current_year = None
+        for value in df.iloc[year_row].tolist():
+            s = str(value).strip()
+            western = re.search(r"((?:19|20)\d{2})", s)
+            era = re.search(r"(令和|平成|昭和)\s*(\d+)", s)
+            short = re.search(r"\b([RHS])\s*(\d{1,2})\b", s, re.I)
+            if western:
+                current_year = int(western.group(1))
+            elif era:
+                current_year = {"令和": 2018, "平成": 1988, "昭和": 1925}[era.group(1)] + int(era.group(2))
+            elif short:
+                current_year = {"R": 2018, "H": 1988, "S": 1925}[short.group(1).upper()] + int(short.group(2))
+            years.append(current_year)
+
+        for month_row in [year_row + 1, year_row + 2]:
+            if month_row >= search_rows:
+                continue
+            found = {}
+            for col_idx, value in enumerate(df.iloc[month_row].tolist()):
+                s = str(value).strip()
+                month_match = re.search(r"^\s*(\d{1,2})\s*月?\s*$", s)
+                if not month_match:
+                    continue
+                month = int(month_match.group(1))
+                year = years[col_idx] if col_idx < len(years) else None
+                if year is not None and 1 <= month <= 12:
+                    found[col_idx] = pd.Timestamp(year=year, month=month, day=1)
+            if len(found) > len(best):
+                best = found
+    return best if len(best) >= 3 else {}
+
+
+def row_month(row, inherited_year=None):
+    # Prefer an explicit year-month cell in the first six columns.
+    for value in row[:min(6, len(row))]:
+        result = parse_month(value)
+        if result is not None:
+            return result
+
+    # Support separate "year" and "month" fields in adjacent cells.
+    text = " ".join(str(value) for value in row[:min(6, len(row))] if str(value).strip())
+    parsed_year = None
+    western = re.search(r"((?:19|20)\d{2})\s*年?", text)
+    era = re.search(r"(令和|平成|昭和)\s*(\d+)", text)
+    short = re.search(r"\b([RHS])\s*(\d{1,2})\b", text, re.I)
+    if western:
+        parsed_year = int(western.group(1))
+    elif era:
+        parsed_year = {"令和": 2018, "平成": 1988, "昭和": 1925}[era.group(1)] + int(era.group(2))
+    elif short:
+        parsed_year = {"R": 2018, "H": 1988, "S": 1925}[short.group(1).upper()] + int(short.group(2))
+    year = parsed_year or inherited_year
+
+    month = None
+    for value in row[:min(6, len(row))]:
+        s = str(value).strip()
+        mm = re.search(r"^\s*(\d{1,2})\s*月?\s*$", s)
+        if mm and 1 <= int(mm.group(1)) <= 12:
+            month = int(mm.group(1))
+    if year and month:
+        return pd.Timestamp(year=year, month=month, day=1)
     return None
 
 
 def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """
-    Parse e-Stat's prefecture-by-month Excel without assuming a fixed sheet layout.
-    The parser looks for a header row containing month-like values and prefecture labels.
-    """
-    pref_names = [
-        "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
-        "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
-        "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
-        "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
-        "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
-        "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
-        "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
-    ]
-    prefectures = set(pref_names)
-    results = []
+    records = []
 
     for sheet_name, raw in sheets.items():
         if raw is None or raw.empty:
             continue
-        df = raw.copy().fillna("")
-        max_rows = min(len(df), 35)
-        for header_idx in range(max_rows):
-            row = [normalize_text(v) for v in df.iloc[header_idx].tolist()]
-            month_cols = {}
-            for col_idx, value in enumerate(row):
-                month = find_month(value)
-                if month is not None:
-                    month_cols[col_idx] = month
-            if len(month_cols) < 3:
-                continue
+        df = raw.copy().reset_index(drop=True)
+        df = df.applymap(lambda x: x if not isinstance(x, str) else x.strip())
 
-            # Determine likely prefecture-name column in the first several columns.
-            pref_col = None
-            for col_idx in range(min(6, df.shape[1])):
-                vals = {normalize_text(v) for v in df.iloc[header_idx + 1:, col_idx].tolist()}
-                if len(vals & prefectures) >= 5:
-                    pref_col = col_idx
-                    break
-            if pref_col is None:
-                continue
-
-            for row_idx in range(header_idx + 1, len(df)):
-                pref = normalize_text(df.iat[row_idx, pref_col])
-                if pref not in prefectures:
-                    continue
-                for col_idx, month in month_cols.items():
-                    if col_idx >= df.shape[1]:
+        # Orientation A: prefectures are row labels; months are column headers.
+        date_cols = month_headers_for_columns(df)
+        pref_col_candidates = []
+        for col_idx in range(min(8, df.shape[1])):
+            pref_hits = get_pref_cells_in_col(df, col_idx)
+            if len(pref_hits) >= 5:
+                pref_col_candidates.append((col_idx, pref_hits))
+        if date_cols and pref_col_candidates:
+            pref_col, pref_rows = max(pref_col_candidates, key=lambda item: len(item[1]))
+            for row_idx, pref in pref_rows.items():
+                for col_idx, month in date_cols.items():
+                    if row_idx >= df.shape[0] or col_idx >= df.shape[1]:
                         continue
-                    raw_value = df.iat[row_idx, col_idx]
-                    if raw_value == "" or pd.isna(raw_value):
+                    value = numeric_value(df.iat[row_idx, col_idx])
+                    if value is None:
                         continue
-                    try:
-                        value = float(str(raw_value).replace(",", "").replace(" ", ""))
-                    except (ValueError, TypeError):
-                        continue
-                    results.append({
-                        "年月": month,
-                        "地域": pref,
-                        "指標": "住宅着工戸数",
-                        "値": value,
-                        "単位": "戸",
-                        "出典": "e-Stat 建築着工統計調査",
+                    records.append({
+                        "年月": month, "地域": pref, "指標": "住宅着工戸数",
+                        "値": value, "単位": "戸", "出典": "e-Stat 建築着工統計調査",
                         "シート": sheet_name,
                     })
-            if results:
-                break
+            if records:
+                continue
 
-    if not results:
+        # Orientation B: prefectures are column headers; months are row labels.
+        pref_header_candidates = []
+        for row_idx in range(min(45, df.shape[0])):
+            pref_cells = get_pref_cells_in_row(df, row_idx)
+            if len(pref_cells) >= 5:
+                pref_header_candidates.append((row_idx, pref_cells))
+        if pref_header_candidates:
+            header_row, pref_cols = max(pref_header_candidates, key=lambda item: len(item[1]))
+            inherited_year = None
+            for row_idx in range(header_row + 1, df.shape[0]):
+                row = df.iloc[row_idx].tolist()
+                # If a standalone year row appears, carry it forward for month-only rows.
+                flat = " ".join(str(value) for value in row[:min(6, len(row))])
+                year_match = re.search(r"((?:19|20)\d{2})\s*年?", flat)
+                era_match = re.search(r"(令和|平成|昭和)\s*(\d+)", flat)
+                short_match = re.search(r"\b([RHS])\s*(\d{1,2})\b", flat, re.I)
+                if year_match:
+                    inherited_year = int(year_match.group(1))
+                elif era_match:
+                    inherited_year = {"令和": 2018, "平成": 1988, "昭和": 1925}[era_match.group(1)] + int(era_match.group(2))
+                elif short_match:
+                    inherited_year = {"R": 2018, "H": 1988, "S": 1925}[short_match.group(1).upper()] + int(short_match.group(2))
+
+                month = row_month(row, inherited_year)
+                if month is None:
+                    continue
+                for col_idx, pref in pref_cols.items():
+                    if col_idx >= len(row):
+                        continue
+                    value = numeric_value(row[col_idx])
+                    if value is None:
+                        continue
+                    records.append({
+                        "年月": month, "地域": pref, "指標": "住宅着工戸数",
+                        "値": value, "単位": "戸", "出典": "e-Stat 建築着工統計調査",
+                        "シート": sheet_name,
+                    })
+            if records:
+                continue
+
+    if not records:
+        sheet_descriptions = []
+        for name, df in sheets.items():
+            if df is None:
+                continue
+            preview = df.head(6).fillna("").astype(str).values.tolist()
+            sheet_descriptions.append(f"シート「{name}」の先頭6行: {preview}")
         raise RuntimeError(
-            "Excelは取得できましたが、都道府県別の月次データを自動判定できませんでした。"
-            "e-StatのExcel表構成が想定と異なる可能性があります。"
+            "Excelファイルは取得できましたが、都道府県と年月の配置を判定できませんでした。\n"
+            + "\n".join(sheet_descriptions[:4])
         )
-    out = pd.DataFrame(results).drop_duplicates(subset=["年月", "地域", "指標"])
-    return out.sort_values(["年月", "地域"]).reset_index(drop=True)
+
+    result = pd.DataFrame(records)
+    result["年月"] = pd.to_datetime(result["年月"])
+    result = result.drop_duplicates(subset=["年月", "地域", "指標"])
+    # The workbook can contain multiple series/sheets; retain positive, valid numeric rows.
+    result = result[result["値"].notna()]
+    result = result.sort_values(["年月", "地域"]).reset_index(drop=True)
+    return result
 
 
-def groq_analysis(data: pd.DataFrame, model: str, api_key: str) -> str:
+def analyze_with_groq(data: pd.DataFrame, api_key: str, model: str) -> str:
     from groq import Groq
     client = Groq(api_key=api_key)
-    summary = (
+    monthly = (
         data.groupby("年月", as_index=False)["値"].sum()
         .sort_values("年月")
         .tail(36)
-        .to_string(index=False)
     )
+    summary = monthly.to_string(index=False)
     prompt = (
-        "あなたは日本の住宅市場データを分析するアナリストです。"
-        "次の住宅着工戸数データに基づき、日本語で簡潔に分析してください。"
-        "長期傾向、直近の変化、解釈上の注意を分け、データにない原因を断定しないでください。\n\n"
-        f"{summary}"
+        "以下は日本の住宅着工戸数データです。日本語で、長期傾向、直近の動き、"
+        "解釈上の注意を簡潔に分析してください。データにない原因は断定しないでください。\n\n"
+        + summary
     )
-    response = client.chat.completions.create(
+    result = client.chat.completions.create(
         model=model or "openai/gpt-oss-20b",
         messages=[
             {"role": "system", "content": "数値に忠実で、根拠のない推測を避ける分析担当者です。"},
@@ -198,52 +413,53 @@ def groq_analysis(data: pd.DataFrame, model: str, api_key: str) -> str:
         ],
         temperature=0.2,
     )
-    return response.choices[0].message.content or "分析結果を取得できませんでした。"
+    return result.choices[0].message.content or "分析結果を取得できませんでした。"
 
 
 st.set_page_config(page_title="住宅着工統計ダッシュボード", page_icon="📊", layout="wide")
 st.title("住宅着工統計ダッシュボード")
-st.caption("e-Statの公開Excelを自動取得して表示します。データ取得元：総務省統計局・国土交通省 e-Stat")
+st.caption("e-Statの公開Excelを自動取得して表示します。")
 
 with st.sidebar:
-    st.header("データ・表示設定")
-    st.write("データはe-Statの公開Excelから自動取得します。")
-    refresh = st.button("データを再取得", use_container_width=True)
-    if refresh:
+    st.header("表示設定")
+    if st.button("e-Statからデータを再取得", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
 try:
-    with st.spinner("e-Statから最新のExcelを取得しています..."):
-        excel_url, dataset_label = fetch_latest_excel_url(
-            ESTAT_HOUSING_LIST_URL, required_words=["都道府県別着工戸数"]
-        )
-        workbook = download_excel(excel_url)
-        data = parse_prefecture_timeseries(workbook)
+    with st.spinner("e-Statの一覧ページを確認し、Excelを取得しています..."):
+        excel_url, dataset_info = fetch_excel_link()
+        sheets = download_workbook(excel_url)
+        data = parse_prefecture_timeseries(sheets)
 except Exception as exc:
-    st.error("e-Statデータを読み込めませんでした。")
+    st.error("e-Statからデータを読み込めませんでした。")
+    st.markdown("**エラーの詳細**")
     st.code(str(exc))
+    st.markdown(f"[e-Statの住宅着工統計一覧を開く]({ESTAT_HOUSING_LIST_URL})")
     st.markdown(
-        f"データ掲載ページ：[{ESTAT_HOUSING_LIST_URL}]({ESTAT_HOUSING_LIST_URL})"
+        "このエラー表示をそのままコピーして共有すると、次の修正箇所を特定できます。"
     )
     st.stop()
 
 data["年月"] = pd.to_datetime(data["年月"])
-min_date = data["年月"].min().date()
-max_date = data["年月"].max().date()
+min_month = data["年月"].min()
+max_month = data["年月"].max()
+min_date = min_month.date()
+max_date = max_month.date()
 
 with st.sidebar:
     start_date = st.date_input("開始月", value=min_date, min_value=min_date, max_value=max_date)
     end_date = st.date_input("終了月", value=max_date, min_value=min_date, max_value=max_date)
     all_regions = sorted(data["地域"].unique().tolist())
-    selected_regions = st.multiselect("都道府県", all_regions, default=all_regions)
-    chart_type = st.selectbox("グラフ形式", ["折れ線", "棒", "面"])
+    default_regions = all_regions if len(all_regions) <= 12 else all_regions
+    regions = st.multiselect("都道府県", all_regions, default=default_regions)
+    chart_type = st.selectbox("推移グラフ", ["折れ線", "棒", "面"])
     show_table = st.checkbox("データ表を表示", value=True)
 
 filtered = data[
     (data["年月"].dt.date >= start_date)
     & (data["年月"].dt.date <= end_date)
-    & (data["地域"].isin(selected_regions))
+    & (data["地域"].isin(regions))
 ].copy()
 
 if filtered.empty:
@@ -252,71 +468,69 @@ if filtered.empty:
 
 latest_month = filtered["年月"].max()
 latest_total = filtered.loc[filtered["年月"] == latest_month, "値"].sum()
-previous_months = sorted(filtered["年月"].unique())
-previous_total = None
-if len(previous_months) >= 2:
-    previous_total = filtered.loc[filtered["年月"] == previous_months[-2], "値"].sum()
+months = sorted(filtered["年月"].drop_duplicates())
+prev_total = None
+if len(months) >= 2:
+    prev_total = filtered.loc[filtered["年月"] == months[-2], "値"].sum()
 
 c1, c2, c3 = st.columns(3)
 c1.metric("表示対象の最新月", latest_month.strftime("%Y年%m月"))
 c2.metric("最新月の合計", f"{latest_total:,.0f} 戸")
-if previous_total is not None:
-    delta = latest_total - previous_total
-    c3.metric("前月比（表示地域合計）", f"{delta:+,.0f} 戸")
+if prev_total is not None:
+    c3.metric("前月比（選択地域合計）", f"{latest_total - prev_total:+,.0f} 戸")
 else:
-    c3.metric("対象都道府県数", f"{filtered['地域'].nunique()}")
+    c3.metric("表示地域数", f"{filtered['地域'].nunique()}")
 
 st.subheader("住宅着工戸数の推移")
 if chart_type == "棒":
-    fig = px.bar(filtered, x="年月", y="値", color="地域", barmode="group", labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
+    fig = px.bar(filtered, x="年月", y="値", color="地域", barmode="group",
+                 labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
 elif chart_type == "面":
-    fig = px.area(filtered, x="年月", y="値", color="地域", labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
+    fig = px.area(filtered, x="年月", y="値", color="地域",
+                  labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
 else:
-    fig = px.line(filtered, x="年月", y="値", color="地域", markers=True, labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
+    fig = px.line(filtered, x="年月", y="値", color="地域", markers=False,
+                  labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
 fig.update_layout(legend_title_text="都道府県", xaxis_title="年月", yaxis_title="住宅着工戸数（戸）")
 st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("最新月の都道府県比較")
 latest = filtered[filtered["年月"] == latest_month].sort_values("値", ascending=False)
-bar = px.bar(latest, x="地域", y="値", labels={"地域": "都道府県", "値": "住宅着工戸数（戸）"})
-bar.update_layout(xaxis_title="", yaxis_title="住宅着工戸数（戸）")
-st.plotly_chart(bar, use_container_width=True)
+compare_fig = px.bar(latest, x="地域", y="値",
+                     labels={"地域": "都道府県", "値": "住宅着工戸数（戸）"})
+compare_fig.update_layout(xaxis_title="", yaxis_title="住宅着工戸数（戸）")
+st.plotly_chart(compare_fig, use_container_width=True)
 
 if show_table:
     st.subheader("データ一覧")
-    display = filtered.sort_values(["年月", "地域"], ascending=[False, True]).copy()
-    display["年月"] = display["年月"].dt.strftime("%Y-%m")
-    st.dataframe(display[["年月", "地域", "値", "単位", "出典"]], use_container_width=True, hide_index=True)
+    table = filtered.sort_values(["年月", "地域"], ascending=[False, True]).copy()
+    table["年月"] = table["年月"].dt.strftime("%Y-%m")
+    st.dataframe(table[["年月", "地域", "値", "単位", "出典"]], use_container_width=True, hide_index=True)
 
-csv_data = filtered.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-st.download_button(
-    "表示データをCSVでダウンロード",
-    data=csv_data,
-    file_name="housing_starts_estat.csv",
-    mime="text/csv",
-)
+csv_bytes = filtered.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+st.download_button("表示データをCSVでダウンロード", csv_bytes,
+                   "housing_starts_estat.csv", "text/csv")
 
 with st.expander("データ取得情報"):
-    st.write("取得先：e-Stat「住宅着工統計 / 時系列表 / 都道府県別着工戸数」")
+    st.write("取得元：e-Stat「建築着工統計調査 / 住宅着工統計 / 時系列表」")
+    st.write("検出した統計表：", dataset_info)
     st.write("ExcelダウンロードURL：", excel_url)
-    st.write("検出したデータセット情報：", dataset_label)
-    st.write("対象期間：", min_date, "～", max_date)
-    st.caption("e-Statの公開Excelの表構成が変更された場合、読み取り処理の調整が必要になることがあります。")
+    st.write("取得期間：", min_date, "～", max_date)
+    st.caption("e-Stat側のページやExcelの表構成が変更された場合、読み取り処理の調整が必要になることがあります。")
 
 st.subheader("AIによる傾向分析")
 try:
-    groq_key = st.secrets.get("GROQ_API_KEY", "")
+    groq_api_key = st.secrets.get("GROQ_API_KEY", "")
     groq_model = st.secrets.get("GROQ_MODEL", "openai/gpt-oss-20b")
 except Exception:
-    groq_key = ""
+    groq_api_key = ""
     groq_model = "openai/gpt-oss-20b"
 
-if not groq_key:
-    st.info("AI分析を使う場合は、Streamlit Cloud の App settings → Secrets に GROQ_API_KEY を設定してください。")
-else:
-    if st.button("表示データをAI分析する"):
-        try:
-            with st.spinner("AIがデータを分析しています..."):
-                st.write(groq_analysis(filtered, groq_model, groq_key))
-        except Exception as exc:
-            st.error(f"AI分析に失敗しました: {exc}")
+if not groq_api_key:
+    st.info("AI分析には、Streamlit Cloud の App settings → Secrets に GROQ_API_KEY を設定してください。")
+elif st.button("表示データをAI分析する"):
+    try:
+        with st.spinner("AIがデータを分析しています..."):
+            st.write(analyze_with_groq(filtered, groq_api_key, groq_model))
+    except Exception as exc:
+        st.error(f"AI分析に失敗しました: {exc}")
