@@ -208,21 +208,54 @@ def numeric_value(value):
         return None
 
 
+def normalize_pref_name(value) -> str:
+    """Normalize Excel cells so full-width or invisible characters do not break matching."""
+    import unicodedata
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = unicodedata.normalize("NFKC", str(value))
+    for char in ("\u200b", "\u200c", "\u200d", "\ufeff", "\u2060"):
+        text = text.replace(char, "")
+    return re.sub(r"[\s\u3000]+", "", text)
+
+
+def match_prefecture(value):
+    """Return prefecture name for an exact cell or a cell with a harmless suffix/code."""
+    text = normalize_pref_name(value)
+    if not text:
+        return None
+    for pref in PREFECTURES:
+        if text == normalize_pref_name(pref):
+            return pref
+    # A few spreadsheet exports append a prefecture code/comment in the same cell.
+    for pref in PREFECTURES:
+        normalized_pref = normalize_pref_name(pref)
+        if text.startswith(normalized_pref):
+            suffix = text[len(normalized_pref):]
+            if re.fullmatch(r"[0-9０-９()（）:：._-]*", suffix):
+                return pref
+    return None
+
+
 def get_pref_cells_in_row(df, row_idx):
     return {
-        col_idx: clean_text(value)
+        col_idx: pref
         for col_idx, value in enumerate(df.iloc[row_idx].tolist())
-        if clean_text(value) in PREF_SET
+        if (pref := match_prefecture(value)) is not None
     }
 
 
 def get_pref_cells_in_col(df, col_idx):
     return {
-        row_idx: clean_text(value)
+        row_idx: pref
         for row_idx, value in enumerate(df.iloc[:, col_idx].tolist())
-        if clean_text(value) in PREF_SET
+        if (pref := match_prefecture(value)) is not None
     }
-
 
 def month_headers_for_columns(df, max_rows=35):
     """
@@ -363,13 +396,7 @@ def find_total_count_column(df: pd.DataFrame, prefecture_col: int) -> int:
 
 
 def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """
-    Parse the actual e-Stat workbook layout shown in the monthly '利用関係別・都道府県別表':
-      - one worksheet per reporting month
-      - prefectures listed vertically in column B (index 1)
-      - total housing starts in column C (index 2)
-      - report month found in the title, e.g. 令和８年８月分
-    """
+    """Parse e-Stat workbook: one worksheet per month, prefecture in column B, total in C."""
     records = []
     sheet_debug = []
 
@@ -377,34 +404,60 @@ def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame
         if raw is None or raw.empty:
             continue
         df = raw.copy().reset_index(drop=True)
-
-        # Normalize text cells only, without DataFrame.applymap (removed in recent pandas).
+        # Normalize ordinary text whitespace; NFKC handling is done when matching prefecture names.
         df = df.apply(lambda column: column.map(lambda x: x.strip() if isinstance(x, str) else x))
         month = parse_month_from_sheet(sheet_name, df)
         if month is None:
             sheet_debug.append(f"シート「{sheet_name}」: タイトル・シート名から年月を特定できません")
             continue
 
-        # Detect the prefecture column in the left-side main table.
+        # Search the left-side main table. Do not require 10+ matches: some valid sheets
+        # may contain fewer rows, and a valid prefecture cell is sufficient evidence.
         prefecture_candidates = []
         for col_idx in range(min(8, df.shape[1])):
             hits = get_pref_cells_in_col(df, col_idx)
-            if len(hits) >= 10:
+            if hits:
                 prefecture_candidates.append((col_idx, hits))
+
         if not prefecture_candidates:
-            sheet_debug.append(f"シート「{sheet_name}」: 都道府県名の列を特定できません")
+            # The observed e-Stat table places prefecture names in column B (index 1).
+            # Explicitly retry this known column before declaring extraction failure.
+            if df.shape[1] > 1:
+                fallback_hits = get_pref_cells_in_col(df, 1)
+                if fallback_hits:
+                    prefecture_candidates.append((1, fallback_hits))
+
+        if not prefecture_candidates:
+            # Diagnostic: show what Excel actually contains in the candidate columns.
+            samples = []
+            for col_idx in range(min(4, df.shape[1])):
+                values = [normalize_pref_name(v) for v in df.iloc[:, col_idx].tolist() if normalize_pref_name(v)]
+                samples.append(f"列{col_idx + 1}={values[:12]}")
+            sheet_debug.append(
+                f"シート「{sheet_name}」: 都道府県名の列を特定できません（" + "; ".join(samples) + "）"
+            )
             continue
-        prefecture_col, prefecture_rows = max(prefecture_candidates, key=lambda item: len(item[1]))
+
+        # Prefer the column with the greatest number of distinct prefectures; in ties,
+        # prefer the leftmost column, which is the main data table, not the auxiliary table.
+        prefecture_col, prefecture_rows = max(
+            prefecture_candidates,
+            key=lambda item: (len(set(item[1].values())), -item[0]),
+        )
 
         try:
             total_col = find_total_count_column(df, prefecture_col)
         except RuntimeError as exc:
-            sheet_debug.append(f"シート「{sheet_name}」: {exc}")
-            continue
+            # In the known e-Stat sheet, column C (index 2) is the left-side 総数 / 戸数.
+            if df.shape[1] > prefecture_col + 1:
+                total_col = prefecture_col + 1
+            else:
+                sheet_debug.append(f"シート「{sheet_name}」: {exc}")
+                continue
 
         rows_added = 0
         for row_idx, prefecture in prefecture_rows.items():
-            if row_idx >= df.shape[0] or total_col >= df.shape[1]:
+            if row_idx < 5 or row_idx >= df.shape[0] or total_col >= df.shape[1]:
                 continue
             value = numeric_value(df.iat[row_idx, total_col])
             if value is None:
@@ -419,9 +472,10 @@ def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame
                 "シート": str(sheet_name),
             })
             rows_added += 1
+
         if rows_added == 0:
             sheet_debug.append(
-                f"シート「{sheet_name}」: 都道府県は検出しましたが、着工戸数の数値がありません"
+                f"シート「{sheet_name}」: 都道府県名は検出しましたが、戸数列（列{total_col + 1}）に数値がありません"
             )
 
     if not records:
@@ -438,7 +492,6 @@ def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame
 
     result = pd.DataFrame(records)
     result["年月"] = pd.to_datetime(result["年月"])
-    # A single prefecture/month should have only one value; discard duplicate sheet rows.
     result = result.drop_duplicates(subset=["年月", "地域", "指標"], keep="first")
     result = result[result["値"].notna()]
     result = result.sort_values(["年月", "地域"]).reset_index(drop=True)
