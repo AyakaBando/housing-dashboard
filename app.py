@@ -519,6 +519,15 @@ def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame
     return result
 
 
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def load_estat_data() -> tuple[pd.DataFrame, str, str]:
+    """取得・Excel解析をキャッシュし、UI操作のたびに繰り返さない。"""
+    excel_url, dataset_info = fetch_excel_link()
+    sheets = download_workbook(excel_url)
+    data = parse_prefecture_timeseries(sheets)
+    return data, excel_url, dataset_info
+
+
 def analyze_with_groq(data: pd.DataFrame, api_key: str, model: str) -> str:
     from groq import Groq
     client = Groq(api_key=api_key)
@@ -550,15 +559,13 @@ st.caption("e-Statの公開Excelを自動取得して表示します。")
 
 with st.sidebar:
     st.header("表示設定")
-    if st.button("e-Statからデータを再取得", use_container_width=True):
+    if st.button("e-Statからデータを再取得", use_container_width=True, help="保存済みキャッシュを削除し、e-StatからExcelを取り直します。"):
         st.cache_data.clear()
         st.rerun()
 
 try:
-    with st.spinner("e-Statの一覧ページを確認し、Excelを取得しています..."):
-        excel_url, dataset_info = fetch_excel_link()
-        sheets = download_workbook(excel_url)
-        data = parse_prefecture_timeseries(sheets)
+    with st.spinner("初回のみe-StatのExcelを取得・解析しています..."):
+        data, excel_url, dataset_info = load_estat_data()
 except Exception as exc:
     st.error("e-Statからデータを読み込めませんでした。")
     st.markdown("**エラーの詳細**")
