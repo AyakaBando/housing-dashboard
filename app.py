@@ -575,14 +575,48 @@ max_month = data["年月"].max()
 min_date = min_month.date()
 max_date = max_month.date()
 
+# Step 1: Select the prefectures first. Do not preselect every prefecture.
 with st.sidebar:
+    st.subheader("① 表示する都道府県")
+    regions = st.multiselect(
+        "都道府県を選択してください（複数選択可）",
+        options=PREFECTURES,
+        default=[],
+        key="selected_prefectures",
+        help="選択した都道府県のデータだけをグラフ・集計・表に表示します。",
+    )
+
+if not regions:
+    st.info("まず、画面左側の「① 表示する都道府県」から表示したい都道府県を選択してください。")
+    st.stop()
+
+# Avoid silently presenting partial results if a selected region was not extracted.
+available_regions = set(data["地域"].dropna().unique().tolist())
+missing_regions = [region for region in regions if region not in available_regions]
+if missing_regions:
+    st.error(
+        "選択した都道府県のデータが、取得したExcelから抽出できていません。"
+        f" 選択中：{', '.join(regions)}。"
+        f" 抽出できている都道府県：{', '.join(sorted(available_regions)) or 'なし'}。"
+    )
+    st.info(
+        "この状態では、データがない都道府県を含めたまま誤った集計を表示しないよう、"
+        "グラフ等を表示していません。"
+    )
+    st.stop()
+
+# Step 2: Set the period and chart options after prefecture selection.
+with st.sidebar:
+    st.divider()
+    st.subheader("② 表示期間・形式")
     start_date = st.date_input("開始月", value=min_date, min_value=min_date, max_value=max_date)
     end_date = st.date_input("終了月", value=max_date, min_value=min_date, max_value=max_date)
-    all_regions = sorted(data["地域"].unique().tolist())
-    default_regions = all_regions if len(all_regions) <= 12 else all_regions
-    regions = st.multiselect("都道府県", all_regions, default=default_regions)
     chart_type = st.selectbox("推移グラフ", ["折れ線", "棒", "面"])
     show_table = st.checkbox("データ表を表示", value=True)
+
+if start_date > end_date:
+    st.error("開始月は終了月以前の日付を指定してください。")
+    st.stop()
 
 filtered = data[
     (data["年月"].dt.date >= start_date)
@@ -591,7 +625,7 @@ filtered = data[
 ].copy()
 
 if filtered.empty:
-    st.warning("指定した条件に該当するデータがありません。")
+    st.warning("選択した都道府県・期間に該当するデータがありません。")
     st.stop()
 
 latest_month = filtered["年月"].max()
@@ -622,7 +656,7 @@ else:
 fig.update_layout(legend_title_text="都道府県", xaxis_title="年月", yaxis_title="住宅着工戸数（戸）")
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("最新月の都道府県比較")
+st.subheader("選択した都道府県の最新月比較")
 latest = filtered[filtered["年月"] == latest_month].sort_values("値", ascending=False)
 compare_fig = px.bar(latest, x="地域", y="値",
                      labels={"地域": "都道府県", "値": "住宅着工戸数（戸）"})
@@ -644,6 +678,7 @@ with st.expander("データ取得情報"):
     st.write("検出した統計表：", dataset_info)
     st.write("ExcelダウンロードURL：", excel_url)
     st.write("取得期間：", min_date, "～", max_date)
+    st.write("表示対象の都道府県：", "、".join(regions))
     st.caption("e-Stat側のページやExcelの表構成が変更された場合、読み取り処理の調整が必要になることがあります。")
 
 st.subheader("AIによる傾向分析")
