@@ -1380,14 +1380,14 @@ def setup_matplotlib_japanese():
     return plt
 
 
-def make_pdf_chart_image(kind, trend_df, compare_df, composition_df, figsize=(7.2, 4.7)):
-    """Render a dashboard chart as a high-resolution Japanese-labelled PNG for A4 PDF."""
+def make_pdf_chart_image(kind, trend_df, compare_df, composition_df, figsize=None):
+    """Render one of the overview charts as a Japanese-labelled PNG."""
     import io
     import matplotlib.dates as mdates
     from matplotlib.ticker import FuncFormatter
 
     plt = setup_matplotlib_japanese()
-    fig, ax = plt.subplots(figsize=figsize, dpi=180)
+    fig, ax = plt.subplots(figsize=figsize or (5.1, 4.0), dpi=160)
 
     if kind == "trend":
         if trend_df.empty:
@@ -1395,16 +1395,15 @@ def make_pdf_chart_image(kind, trend_df, compare_df, composition_df, figsize=(7.
             ax.set_axis_off()
         else:
             x = pd.to_datetime(trend_df["年月"])
-            ax.plot(x, trend_df["値"], label="月別実績", color="#3478f6", linewidth=2.0)
-            ax.plot(x, trend_df["年度累計"], label="年度累計", color="#32a879", linewidth=2.0)
-            ax.plot(x, trend_df["移動年計"], label="移動年計（12か月）", color="#ef5350", linewidth=2.0)
-            ax.set_ylabel("着工戸数（戸）", fontsize=10)
+            ax.plot(x, trend_df["値"], label="月別実績", color="#3478f6", linewidth=1.5)
+            ax.plot(x, trend_df["年度累計"], label="年度累計", color="#32a879", linewidth=1.5)
+            ax.plot(x, trend_df["移動年計"], label="移動年計（12か月）", color="#ef5350", linewidth=1.5)
+            ax.set_ylabel("着工戸数（戸）")
             ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:,.0f}"))
             ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y年%m月"))
-            ax.tick_params(axis="x", labelrotation=25, labelsize=9)
-            ax.tick_params(axis="y", labelsize=9)
-            ax.legend(loc="upper left", fontsize=9, frameon=False, ncol=3)
+            ax.tick_params(axis="x", labelrotation=25, labelsize=8)
+            ax.legend(loc="upper left", fontsize=8, frameon=False)
             ax.grid(True, alpha=0.22)
     elif kind == "compare":
         if compare_df.empty:
@@ -1414,49 +1413,39 @@ def make_pdf_chart_image(kind, trend_df, compare_df, composition_df, figsize=(7.
             months = list(compare_df["月ラベル"])
             pos = list(range(len(months)))
             width = 0.37
-            ax.bar([p - width / 2 for p in pos], compare_df["前年値"], width=width,
-                   label=compare_df.attrs.get("前年ラベル", "前年"), color="#a6b1bd")
-            ax.bar([p + width / 2 for p in pos], compare_df["最新年値"], width=width,
-                   label=compare_df.attrs.get("最新年ラベル", "最新年"), color="#3478f6")
+            ax.bar([p - width / 2 for p in pos], compare_df["前年値"], width=width, label=compare_df.attrs.get("前年ラベル", "前年"), color="#a6b1bd")
+            ax.bar([p + width / 2 for p in pos], compare_df["最新年値"], width=width, label=compare_df.attrs.get("最新年ラベル", "最新年"), color="#3478f6")
             ax.set_xticks(pos, months)
-            ax.set_ylabel("着工戸数（戸）", fontsize=10)
-            ax.tick_params(axis="x", labelsize=9)
-            ax.tick_params(axis="y", labelsize=9)
+            ax.set_ylabel("着工戸数（戸）")
             ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:,.0f}"))
-            ax.legend(loc="upper left", fontsize=9, frameon=False, ncol=2)
+            ax.legend(loc="upper left", fontsize=8, frameon=False)
             ax.grid(True, axis="y", alpha=0.22)
     elif kind == "composition":
         if composition_df.empty or composition_df["値"].sum() <= 0:
             ax.text(0.5, 0.5, "構成比を表示できるデータがありません", ha="center", va="center", transform=ax.transAxes)
             ax.set_axis_off()
         else:
-            labels = composition_df["表示名"].astype(str).tolist()
-            values = pd.to_numeric(composition_df["値"], errors="coerce").fillna(0).tolist()
-            wedges, texts, autotexts = ax.pie(
-                values, labels=labels, autopct="%1.1f%%", startangle=90, counterclock=False,
-                pctdistance=0.77, labeldistance=1.08,
+            ax.pie(
+                composition_df["値"], labels=composition_df["表示名"], autopct="%1.1f%%",
+                startangle=90, counterclock=False, pctdistance=0.77,
                 wedgeprops={"width": 0.42, "edgecolor": "white"},
-                textprops={"fontsize": 10},
+                textprops={"fontsize": 8},
             )
-            for txt in autotexts:
-                txt.set_fontsize(9)
-                txt.set_fontweight("bold")
             ax.set_aspect("equal")
 
-    fig.tight_layout(pad=1.3)
+    fig.tight_layout(pad=1.2)
     output = io.BytesIO()
-    fig.savefig(output, format="png", dpi=180, bbox_inches="tight", facecolor="white")
+    fig.savefig(output, format="png", dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     output.seek(0)
     return output
-
 
 
 def create_dashboard_pdf(region_label, start_date, end_date, latest_month, cards, trend_df, compare_df, composition_df):
-    """A4 portrait overview PDF spread across two readable pages."""
+    """Export the overview to two consistently sized A4 landscape pages for readability."""
     import io
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.utils import ImageReader
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
@@ -1466,154 +1455,248 @@ def create_dashboard_pdf(region_label, start_date, end_date, latest_month, cards
         pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
     except Exception:
         pass
-    page_width, page_height = A4
+
+    # Use exactly the same physical page size as all other report pages.
+    page_width, page_height = landscape(A4)
     output = io.BytesIO()
-    pdf = canvas.Canvas(output, pagesize=A4, pageCompression=1)
+    pdf = canvas.Canvas(output, pagesize=(page_width, page_height), pageCompression=1)
     pdf.setTitle(f"住宅着工統計ダッシュボード - {region_label}")
     pdf.setAuthor("住宅着工統計ダッシュボード")
     font = "HeiseiKakuGo-W5"
-    margin = 34
-    content_width = page_width - margin * 2
+    margin = 24
     navy = colors.HexColor("#263746")
-    muted = colors.HexColor("#64748b")
+    grey = colors.HexColor("#64748b")
     border = colors.HexColor("#d9e0e8")
 
-    # Page 1: overview title, six KPI cards in a readable 2 x 3 grid, and one large trend chart.
-    pdf.setFillColor(navy)
-    pdf.setFont(font, 19)
-    pdf.drawString(margin, page_height - 39, "住宅着工統計｜市場概況")
-    pdf.setFont(font, 9)
-    pdf.setFillColor(muted)
-    pdf.drawString(margin, page_height - 59,
-                   f"地域：{region_label}　対象期間：{start_date:%Y年%m月}～{end_date:%Y年%m月}　最新月：{latest_month:%Y年%m月}")
-    pdf.setStrokeColor(border)
-    pdf.line(margin, page_height - 70, page_width - margin, page_height - 70)
+    def draw_header(page_subtitle, page_no):
+        pdf.setFillColor(navy)
+        pdf.setFont(font, 16)
+        pdf.drawString(margin, page_height - 28, "住宅着工統計ダッシュボード")
+        pdf.setFillColor(grey)
+        pdf.setFont(font, 8.5)
+        pdf.drawString(
+            margin, page_height - 45,
+            f"地域：{region_label}　対象期間：{start_date:%Y年%m月}～{end_date:%Y年%m月}　最新月：{latest_month:%Y年%m月}"
+        )
+        pdf.setFillColor(navy)
+        pdf.setFont(font, 10)
+        pdf.drawString(margin, page_height - 65, page_subtitle)
+        pdf.setFillColor(grey)
+        pdf.setFont(font, 7)
+        pdf.drawString(margin, 16, "出典：e-Stat 建築着工統計調査")
+        pdf.drawRightString(page_width - margin, 16, f"{page_no} / 2")
 
-    gap_x, gap_y = 10, 8
-    card_width = (content_width - gap_x) / 2
-    card_height = 54
-    top = page_height - 88
-    for idx, card in enumerate(cards[:6]):
-        row, col = divmod(idx, 2)
-        x = margin + col * (card_width + gap_x)
-        y = top - (row + 1) * card_height - row * gap_y
+    # Page 1: KPI cards in a 3x2 grid, then a large full-width trend chart.
+    draw_header("市場概況・住宅着工戸数の推移", 1)
+    card_gap_x, card_gap_y = 9, 8
+    card_cols = 3
+    card_width = (page_width - 2 * margin - card_gap_x * (card_cols - 1)) / card_cols
+    card_height = 60
+    # Two rows below the header leave space for the full-width trend chart.
+    row_y = [page_height - 101 - card_height, page_height - 101 - card_height * 2 - card_gap_y]
+    for i, card in enumerate(cards[:6]):
+        col = i % card_cols
+        row = i // card_cols
+        x = margin + col * (card_width + card_gap_x)
+        y = row_y[row]
         pdf.setFillColor(colors.white)
         pdf.setStrokeColor(border)
-        pdf.roundRect(x, y, card_width, card_height, 5, stroke=1, fill=1)
+        pdf.roundRect(x, y, card_width, card_height, 4, stroke=1, fill=1)
         pdf.setFillColor(colors.HexColor(card.get("color", "#3478f6")))
-        pdf.roundRect(x, y + card_height - 4, card_width, 4, 2, stroke=0, fill=1)
+        pdf.rect(x, y + card_height - 3, card_width, 3, stroke=0, fill=1)
         pdf.setFillColor(navy)
-        pdf.setFont(font, 8.7)
-        pdf.drawString(x + 9, y + 39, str(card.get("label", "")))
-        pdf.setFont(font, 15)
-        pdf.drawString(x + 9, y + 21, str(card.get("value", "—")))
-        pdf.setFont(font, 6.8)
-        pdf.setFillColor(muted)
-        pdf.drawString(x + 9, y + 7, str(card.get("previous", ""))[:40])
+        pdf.setFont(font, 8)
+        pdf.drawString(x + 8, y + 43, str(card.get("label", ""))[:45])
+        pdf.setFont(font, 14)
+        pdf.drawString(x + 8, y + 25, str(card.get("value", ""))[:35])
+        pdf.setFillColor(grey)
+        pdf.setFont(font, 7)
+        pdf.drawString(x + 8, y + 9, str(card.get("previous", ""))[:55])
         pdf.setFillColor(colors.HexColor(card.get("yoy_color", "#64748b")))
-        pdf.setFont(font, 7.2)
-        pdf.drawRightString(x + card_width - 8, y + 7, f"前年同月比 {card.get('yoy', '—')}")
+        pdf.drawRightString(x + card_width - 8, y + 9, str(card.get("yoy", ""))[:22])
 
-    chart_title_y = 548
-    pdf.setFillColor(navy)
-    pdf.setFont(font, 12)
-    pdf.drawString(margin, chart_title_y, "住宅着工戸数の推移")
-    trend_img = make_pdf_chart_image("trend", trend_df, compare_df, composition_df, figsize=(7.2, 4.7))
-    pdf.drawImage(ImageReader(trend_img), margin, 137, width=content_width, height=395,
+    trend_image = make_pdf_chart_image("trend", trend_df, compare_df, composition_df, figsize=(10.8, 3.9))
+    trend_x = margin
+    trend_y = 28
+    trend_w = page_width - margin * 2
+    trend_h = 300
+    pdf.drawImage(ImageReader(trend_image), trend_x, trend_y, width=trend_w, height=trend_h,
                   preserveAspectRatio=True, anchor="c", mask="auto")
-    pdf.setFont(font, 7)
-    pdf.setFillColor(muted)
-    pdf.drawString(margin, 30, "出典：e-Stat 建築着工統計調査")
-    pdf.drawRightString(page_width - margin, 30, "市場概況")
+    pdf.setStrokeColor(border)
+    pdf.roundRect(trend_x, trend_y, trend_w, trend_h, 3, stroke=1, fill=0)
     pdf.showPage()
 
-    # Page 2: one chart per section, stacked vertically to preserve label and legend readability.
+    # Page 2: monthly comparison and composition are enlarged into two side-by-side panels.
+    draw_header("年度比較・利用関係別構成比", 2)
+    gap = 14
+    panel_width = (page_width - 2 * margin - gap) / 2
+    panel_y, panel_h = 52, page_height - 165
+    compare_x = margin
+    composition_x = margin + panel_width + gap
     pdf.setFillColor(navy)
-    pdf.setFont(font, 17)
-    pdf.drawString(margin, page_height - 39, "住宅着工統計｜年度・構成比較")
-    pdf.setFont(font, 9)
-    pdf.setFillColor(muted)
-    pdf.drawString(margin, page_height - 59,
-                   f"地域：{region_label}　対象期間：{start_date:%Y年%m月}～{end_date:%Y年%m月}")
+    pdf.setFont(font, 10)
+    pdf.drawString(compare_x, page_height - 91,
+                   "月別比較（" + compare_df.attrs.get("前年ラベル", "前年") + "・" + compare_df.attrs.get("最新年ラベル", "最新年") + "）")
+    pdf.drawString(composition_x, page_height - 91, f"利用関係別構成比（{latest_month:%Y年%m月}）")
+    compare_image = make_pdf_chart_image("compare", trend_df, compare_df, composition_df, figsize=(5.4, 4.8))
+    composition_image = make_pdf_chart_image("composition", trend_df, compare_df, composition_df, figsize=(5.0, 5.0))
+    pdf.drawImage(ImageReader(compare_image), compare_x, panel_y, width=panel_width, height=panel_h,
+                  preserveAspectRatio=True, anchor="c", mask="auto")
+    pdf.drawImage(ImageReader(composition_image), composition_x, panel_y, width=panel_width, height=panel_h,
+                  preserveAspectRatio=True, anchor="c", mask="auto")
     pdf.setStrokeColor(border)
-    pdf.line(margin, page_height - 70, page_width - margin, page_height - 70)
-
-    pdf.setFillColor(navy)
-    pdf.setFont(font, 11.5)
-    comp_title = "年度別の月次比較（" + compare_df.attrs.get("前年ラベル", "前年") + "・" + compare_df.attrs.get("最新年ラベル", "最新年") + "）"
-    pdf.drawString(margin, 746, comp_title)
-    compare_img = make_pdf_chart_image("compare", trend_df, compare_df, composition_df, figsize=(7.2, 3.65))
-    pdf.drawImage(ImageReader(compare_img), margin, 431, width=content_width, height=296,
-                  preserveAspectRatio=True, anchor="c", mask="auto")
-
-    pdf.setFillColor(navy)
-    pdf.setFont(font, 11.5)
-    pdf.drawString(margin, 402, f"利用関係別構成比（{latest_month:%Y年%m月}）")
-    composition_img = make_pdf_chart_image("composition", trend_df, compare_df, composition_df, figsize=(7.2, 3.65))
-    pdf.drawImage(ImageReader(composition_img), margin, 60, width=content_width, height=320,
-                  preserveAspectRatio=True, anchor="c", mask="auto")
-    pdf.setFont(font, 7)
-    pdf.setFillColor(muted)
-    pdf.drawString(margin, 30, "出典：e-Stat 建築着工統計調査")
-    pdf.drawRightString(page_width - margin, 30, "年度・構成比較")
+    pdf.roundRect(compare_x, panel_y, panel_width, panel_h, 3, stroke=1, fill=0)
+    pdf.roundRect(composition_x, panel_y, panel_width, panel_h, 3, stroke=1, fill=0)
     pdf.showPage()
     pdf.save()
     return output.getvalue()
 
 
+def _chart_display_unit(values, unit):
+    """Choose a compact Japanese scale for large floor-area values."""
+    import numpy as np
+    series = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+    max_abs = float(series.abs().max()) if not series.empty else 0.0
+    normalized_unit = str(unit or "").replace(" ", "").replace("　", "")
+    factor, display_unit = 1.0, normalized_unit or "値"
+
+    if normalized_unit in {"㎡", "m²", "m2", "平方メートル", "平米"}:
+        if max_abs >= 100_000_000:
+            factor, display_unit = 100_000_000.0, "億㎡"
+        elif max_abs >= 10_000:
+            factor, display_unit = 10_000.0, "万㎡"
+    elif normalized_unit in {"千㎡", "千m²", "千平方メートル"}:
+        if max_abs >= 100_000:
+            factor, display_unit = 100_000.0, "億㎡"
+        elif max_abs >= 10:
+            factor, display_unit = 10.0, "万㎡"
+    return factor, display_unit
+
+
+def _compact_category_label(value, max_chars=24):
+    """Shorten multi-level e-Stat labels while preserving the distinctions being compared."""
+    import unicodedata
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = re.sub(r"\s+", "", text)
+    replacements = [
+        ("鉄骨鉄筋コンクリート造", "SRC造"),
+        ("鉄筋コンクリート造", "RC造"),
+        ("コンクリートブロック造", "CB造"),
+        ("鉄骨造", "S造"),
+        ("非住宅建築物", "非住宅"),
+        ("床面積の合計", "床面積"),
+        ("建築物の数", "棟数"),
+        ("一戸建て", "戸建"),
+        ("一戸建", "戸建"),
+        ("長屋建て", "長屋"),
+        ("長屋建", "長屋"),
+    ]
+    for old, new in replacements:
+        text = text.replace(old, new)
+
+    raw_parts = re.split(r"[／/｜|]+", text)
+    parts = []
+    for part in raw_parts:
+        part = part.strip("・_－-:：")
+        if not part or part in {"構造別", "用途別", "建て方別", "利用関係別", "都道府県別", "戸数", "床面積", "値", "計", "総数", "総計"}:
+            continue
+        if part not in parts:
+            parts.append(part)
+    if not parts:
+        parts = [text or "全体"]
+    compact = "・".join(parts)
+
+    # Wrap only at meaningful category boundaries. For unusually long single labels,
+    # split by character to prevent the label from pushing the plot out of its page.
+    if len(compact) <= max_chars:
+        return compact
+    lines, current = [], ""
+    for part in parts:
+        if len(part) > max_chars:
+            if current:
+                lines.append(current)
+                current = ""
+            for offset in range(0, len(part), max_chars):
+                lines.append(part[offset:offset + max_chars])
+        elif not current:
+            current = part
+        elif len(current) + 1 + len(part) <= max_chars:
+            current += "・" + part
+        else:
+            lines.append(current)
+            current = part
+    if current:
+        lines.append(current)
+    return "\n".join(lines)
 
 
 def _render_generic_pdf_chart(spec):
-    """Render a high-resolution chart with readable labels for A4 portrait pages."""
+    """Render one legible Japanese chart at full-page resolution for A4 PDF output."""
     import io
     import matplotlib.dates as mdates
     from matplotlib.ticker import FuncFormatter
+
     plt = setup_matplotlib_japanese()
-    fig, ax = plt.subplots(figsize=(7.2, 4.1), dpi=180)
     df = spec.get("data", pd.DataFrame()).copy()
     kind = spec.get("kind", "line")
-    unit = spec.get("unit", "値")
+    raw_unit = spec.get("unit", "値")
+    if "値" in df.columns:
+        df["値"] = pd.to_numeric(df["値"], errors="coerce")
+    factor, display_unit = _chart_display_unit(df["値"] if "値" in df else [], raw_unit)
+    if "値" in df.columns:
+        df["_表示値"] = df["値"] / factor
+
+    # A4 landscape's plotting area is wide; keep a fixed canvas size so every page
+    # uses the same scaling instead of being shrunk by varying tight bounding boxes.
+    fig, ax = plt.subplots(figsize=(10.8, 6.2), dpi=160)
     if df.empty:
-        ax.text(0.5, 0.5, "表示できるデータがありません", ha="center", va="center", transform=ax.transAxes, fontsize=12)
+        ax.text(0.5, 0.5, "表示できるデータがありません", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
     elif kind == "bar":
-        df = df.sort_values("値", ascending=True)
-        labels = df["指標"].astype(str).tolist()
-        ax.barh(labels, pd.to_numeric(df["値"], errors="coerce"), color="#3478f6")
-        ax.set_xlabel(unit, fontsize=10)
-        ax.tick_params(axis="y", labelsize=9)
-        ax.tick_params(axis="x", labelsize=9)
-        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:,.0f}"))
-        ax.grid(True, axis="x", alpha=0.2)
+        df = df.sort_values("_表示値", ascending=True)
+        full_labels = df["指標"].astype(str).tolist()
+        labels = [_compact_category_label(label, max_chars=22) for label in full_labels]
+        values = pd.to_numeric(df["_表示値"], errors="coerce").fillna(0).tolist()
+        y_positions = list(range(len(labels)))
+        ax.barh(y_positions, values, color="#3478f6", height=0.68)
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(labels)
+        ax.set_xlabel(f"値（{display_unit}）", fontsize=10)
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:,.0f}" if abs(v) >= 10 else f"{v:,.1f}".rstrip("0").rstrip(".")))
+        ax.tick_params(axis="y", labelsize=8.5, pad=7)
+        ax.tick_params(axis="x", labelsize=8.5)
+        ax.grid(True, axis="x", alpha=0.22)
+        # More left margin for Japanese multi-level labels; the labels themselves are abbreviated/wrapped.
+        fig.subplots_adjust(left=0.29, right=0.98, top=0.90, bottom=0.12)
     else:
         for label, group in df.groupby("指標", sort=False):
             group = group.sort_values("年月")
-            ax.plot(pd.to_datetime(group["年月"]), pd.to_numeric(group["値"], errors="coerce"),
-                    label=str(label), linewidth=2.0)
-        ax.set_ylabel(unit, fontsize=10)
-        ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=7))
+            ax.plot(pd.to_datetime(group["年月"]), pd.to_numeric(group["_表示値"], errors="coerce"),
+                    label=_compact_category_label(label, max_chars=24), linewidth=1.8)
+        ax.set_ylabel(display_unit, fontsize=10)
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=8))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y年%m月"))
-        ax.tick_params(axis="x", labelrotation=25, labelsize=9)
-        ax.tick_params(axis="y", labelsize=9)
+        ax.tick_params(axis="x", labelrotation=20, labelsize=8.5)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:,.0f}" if abs(v) >= 10 else f"{v:,.1f}".rstrip("0").rstrip(".")))
+        ax.tick_params(axis="y", labelsize=8.5)
         if df["指標"].nunique() > 1:
-            ax.legend(loc="best", fontsize=8.5, frameon=False, ncol=2)
-        ax.grid(True, alpha=0.2)
-    ax.set_title(str(spec.get("title", "")), fontsize=13, loc="left", pad=10)
-    fig.tight_layout(pad=1.4)
+            ax.legend(loc="best", fontsize=8, frameon=False)
+        ax.grid(True, alpha=0.22)
+        fig.subplots_adjust(left=0.10, right=0.98, top=0.90, bottom=0.16)
+
+    ax.set_title(str(spec.get("title", "")), fontsize=13, loc="left", pad=12)
     output = io.BytesIO()
-    fig.savefig(output, format="png", dpi=180, bbox_inches="tight", facecolor="white")
+    fig.savefig(output, format="png", dpi=160, facecolor="white")
     plt.close(fig)
     output.seek(0)
     return output
 
 
-
 def create_multi_chart_pdf(title, region_label, period_label, specs):
-    """Create a readable A4 portrait PDF with up to two large charts per page."""
+    """Create a same-size A4 landscape PDF with one full-size chart per page."""
     import io
-    import math
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.utils import ImageReader
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
@@ -1622,146 +1705,46 @@ def create_multi_chart_pdf(title, region_label, period_label, specs):
         pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
     except Exception:
         pass
-    width, height = A4
+
+    width, height = landscape(A4)
     out = io.BytesIO()
-    pdf = canvas.Canvas(out, pagesize=A4, pageCompression=1)
+    pdf = canvas.Canvas(out, pagesize=(width, height), pageCompression=1)
     pdf.setTitle(f"{title} - {region_label}")
     font = "HeiseiKakuGo-W5"
-    margin, header_h, footer_h = 34, 82, 29
-    per_page = 2
+    margin = 24
     if not specs:
         specs = [{"title": title, "data": pd.DataFrame(), "kind": "line", "unit": "値"}]
-    total_pages = math.ceil(len(specs) / per_page)
-    for page_no, start in enumerate(range(0, len(specs), per_page), start=1):
+    total_pages = len(specs)
+
+    for page_no, spec in enumerate(specs, start=1):
         pdf.setFillColor(colors.HexColor("#263746"))
-        pdf.setFont(font, 17)
-        pdf.drawString(margin, height - 39, title)
-        pdf.setFont(font, 9)
+        pdf.setFont(font, 15)
+        pdf.drawString(margin, height - 28, title)
+        pdf.setFillColor(colors.HexColor("#344054"))
+        pdf.setFont(font, 11)
+        chart_title = str(spec.get("title", title))
+        pdf.drawString(margin, height - 48, chart_title[:100])
+        pdf.setFont(font, 8.5)
         pdf.setFillColor(colors.HexColor("#64748b"))
-        pdf.drawString(margin, height - 59, f"地域：{region_label}　対象期間：{period_label}")
+        pdf.drawString(margin, height - 64, f"地域：{region_label}　対象期間：{period_label}")
+
+        image = _render_generic_pdf_chart(spec)
+        image_x = margin
+        image_y = 34
+        image_w = width - margin * 2
+        image_h = height - 112
+        pdf.drawImage(ImageReader(image), image_x, image_y, width=image_w, height=image_h,
+                      preserveAspectRatio=True, anchor="c", mask="auto")
         pdf.setStrokeColor(colors.HexColor("#d9e0e8"))
-        pdf.line(margin, height - 70, width - margin, height - 70)
-        batch = specs[start:start + per_page]
-        gap_y = 16
-        cell_w = width - margin * 2
-        content_top = height - header_h
-        cell_h = (height - header_h - footer_h - 2 * gap_y) / 2
-        for idx, spec in enumerate(batch):
-            row = idx
-            y = content_top - (row + 1) * cell_h - row * gap_y
-            image = _render_generic_pdf_chart(spec)
-            pdf.drawImage(ImageReader(image), margin, y, width=cell_w, height=cell_h,
-                          preserveAspectRatio=True, anchor="c", mask="auto")
-            pdf.setStrokeColor(colors.HexColor("#d9e0e8"))
-            pdf.roundRect(margin, y, cell_w, cell_h, 4, stroke=1, fill=0)
+        pdf.roundRect(image_x, image_y, image_w, image_h, 3, stroke=1, fill=0)
         pdf.setFont(font, 7)
         pdf.setFillColor(colors.HexColor("#64748b"))
-        pdf.drawString(margin, 14, "出典：e-Stat 公開統計表")
-        pdf.drawRightString(width - margin, 14, f"{page_no} / {total_pages}")
+        pdf.drawString(margin, 16, "出典：e-Stat 公開統計表")
+        pdf.drawRightString(width - margin, 16, f"{page_no} / {total_pages}")
         pdf.showPage()
+
     pdf.save()
     return out.getvalue()
-
-
-
-def create_status_pdf(title, region_label, period_label, message, source_url=None):
-    """Make a readable A4 portrait status page when a source is unavailable."""
-    import io
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-    from reportlab.pdfgen import canvas
-    try:
-        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
-    except Exception:
-        pass
-    width, height = A4
-    output = io.BytesIO()
-    pdf = canvas.Canvas(output, pagesize=A4, pageCompression=1)
-    pdf.setTitle(title)
-    font = "HeiseiKakuGo-W5"
-    margin = 36
-    pdf.setFillColor(colors.HexColor("#263746")); pdf.setFont(font, 18)
-    pdf.drawString(margin, height - 44, title)
-    pdf.setFont(font, 9); pdf.setFillColor(colors.HexColor("#64748b"))
-    pdf.drawString(margin, height - 64, f"地域：{region_label}　対象期間：{period_label}")
-    pdf.setStrokeColor(colors.HexColor("#d9e0e8")); pdf.line(margin, height - 76, width - margin, height - 76)
-    pdf.setFillColor(colors.HexColor("#344054")); pdf.setFont(font, 11)
-    max_width = width - 2 * margin
-    y = height - 112
-    for paragraph in str(message).splitlines() or [str(message)]:
-        line = ""
-        for char in paragraph:
-            candidate = line + char
-            if pdfmetrics.stringWidth(candidate, font, 11) > max_width and line:
-                pdf.drawString(margin, y, line)
-                y -= 20
-                line = char
-                if y < 120:
-                    break
-            else:
-                line = candidate
-        if line and y >= 120:
-            pdf.drawString(margin, y, line)
-            y -= 24
-        if y < 120:
-            break
-    if source_url and y > 80:
-        pdf.setFillColor(colors.HexColor("#3478f6")); pdf.setFont(font, 8)
-        pdf.drawString(margin, 72, "出典ページ：")
-        pdf.setFillColor(colors.HexColor("#3478f6")); pdf.setFont("Helvetica", 7)
-        url = str(source_url)
-        # Split long URLs into lines rather than clipping them at the edge.
-        chunks = [url[i:i + 88] for i in range(0, len(url), 88)]
-        for i, chunk in enumerate(chunks[:3]):
-            pdf.drawString(margin, 58 - i * 10, chunk)
-    pdf.save(); output.seek(0)
-    return output.getvalue()
-
-
-
-def merge_pdf_documents(documents):
-    """Merge all sections to consistent A4 portrait pages and add global page numbers."""
-    import io
-    from pypdf import PdfReader, PdfWriter
-    from reportlab.pdfgen import canvas
-    from reportlab.lib import colors
-    writer = PdfWriter()
-    for _title, pdf_bytes in documents:
-        if pdf_bytes:
-            writer.append(io.BytesIO(pdf_bytes))
-    total_pages = len(writer.pages)
-    if total_pages:
-        for page_no, page in enumerate(writer.pages, start=1):
-            page_width = float(page.mediabox.width)
-            page_height = float(page.mediabox.height)
-            overlay_buffer = io.BytesIO()
-            overlay = canvas.Canvas(overlay_buffer, pagesize=(page_width, page_height), pageCompression=1)
-            # Cover local page numbering in the lower-right corner and replace it with a global count.
-            overlay.setFillColor(colors.white)
-            overlay.rect(page_width - 118, 0, 118, 26, stroke=0, fill=1)
-            try:
-                from reportlab.pdfbase import pdfmetrics
-                from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-                pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
-                font = "HeiseiKakuGo-W5"
-            except Exception:
-                font = "Helvetica"
-            overlay.setFillColor(colors.HexColor("#64748b"))
-            overlay.setFont(font, 7)
-            overlay.drawRightString(page_width - 34, 14, f"ページ {page_no} / {total_pages}")
-            overlay.save()
-            overlay_buffer.seek(0)
-            overlay_page = PdfReader(overlay_buffer).pages[0]
-            page.merge_page(overlay_page)
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
-
-
-
-
 
 def prepare_overview_pdf_data(region_data, start_date, end_date, latest_month):
     """Build the three standard overview charts for export independently of the visible tab."""
@@ -1801,8 +1784,52 @@ def prepare_overview_pdf_data(region_data, start_date, end_date, latest_month):
     return trend_df, compare_df, pd.DataFrame(composition_rows)
 
 
+def create_status_pdf(title, region_label, period_label, message, source_url=None):
+    """Make a transparent placeholder page when a source needs configuration or is unavailable."""
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfgen import canvas
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+    except Exception:
+        pass
+    width, height = landscape(A4)
+    output = io.BytesIO()
+    pdf = canvas.Canvas(output, pagesize=(width, height))
+    pdf.setTitle(title)
+    font = "HeiseiKakuGo-W5"
+    pdf.setFillColor(colors.HexColor("#263746")); pdf.setFont(font, 18)
+    pdf.drawString(32, height - 42, title)
+    pdf.setFont(font, 10); pdf.setFillColor(colors.HexColor("#64748b"))
+    pdf.drawString(32, height - 64, f"地域：{region_label}　対象期間：{period_label}")
+    pdf.setFillColor(colors.HexColor("#344054")); pdf.setFont(font, 12)
+    y = height - 112
+    for line in str(message).splitlines():
+        pdf.drawString(38, y, line[:100])
+        y -= 24
+        if y < 70:
+            break
+    if source_url:
+        pdf.setFillColor(colors.HexColor("#3478f6")); pdf.setFont(font, 8)
+        pdf.drawString(32, 35, f"出典ページ：{source_url[:130]}")
+    pdf.save(); output.seek(0)
+    return output.getvalue()
 
 
+def merge_pdf_documents(documents):
+    """Merge PDFs from every analysis screen into a single downloadable file."""
+    from pypdf import PdfWriter
+    import io
+    writer = PdfWriter()
+    for _title, pdf_bytes in documents:
+        if pdf_bytes:
+            writer.append(io.BytesIO(pdf_bytes))
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 def regional_dataset_specs(raw_df, selected_region, start_date, end_date, title, default_keywords=(), max_metrics=8):
@@ -2105,8 +2132,8 @@ if st.session_state.get("all_screens_pdf_signature") != combined_signature:
     st.session_state.pop("all_screens_pdf_signature", None)
 with st.container(border=True):
     st.markdown("**PDFレポート**")
-    st.caption("A4縦・分析テーマごとにページを分け、グラフを大きく配置したレポートを作成します。")
-    if st.button("全分析画面をA4 PDFにまとめる", type="primary", key="all_screens_pdf_button"):
+    st.caption("市場概況・住宅着工の詳細・構造／建て方・建築規模／非住宅・リフォーム市場を1つのPDFにまとめます。")
+    if st.button("全分析画面を1つのPDFにまとめる", type="primary", key="all_screens_pdf_button"):
         try:
             with st.spinner("全分析画面のデータとグラフをまとめています。初回は取得に時間がかかる場合があります..."):
                 all_pdf, pdf_notes = build_all_screens_pdf(
@@ -2120,7 +2147,7 @@ with st.container(border=True):
     if st.session_state.get("all_screens_pdf_signature") == combined_signature and st.session_state.get("all_screens_pdf_bytes"):
         safe_region = re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龠_-]+", "_", selected_region)
         st.download_button(
-            "全分析画面のA4 PDFをダウンロード",
+            "全分析画面をまとめたPDFをダウンロード",
             st.session_state["all_screens_pdf_bytes"],
             file_name=f"住宅市場分析_全画面_{safe_region}_{start_date:%Y%m}_{end_date:%Y%m}.pdf",
             mime="application/pdf", key="all_screens_pdf_download", use_container_width=True)
@@ -2461,12 +2488,28 @@ elif analysis_view == "建築規模・非住宅":
             b_labels = sorted(b_latest["指標"].astype(str).unique().tolist())
             b_defaults = choose_default_metrics(b_labels, 8, ("非住宅", "店舗", "事務所", "工場", "倉庫", "鉄骨", "鉄筋", "木造"))
             b_selected = st.multiselect("比較する用途・構造", b_labels, default=b_defaults, key="building_struct_metrics")
-            b_visible = b_latest[b_latest["指標"].isin(b_selected)]
+            b_visible = b_latest[b_latest["指標"].isin(b_selected)].copy()
             if not b_visible.empty:
                 b_unit_label = str(b_visible["単位"].iloc[0]) if "単位" in b_visible.columns else "値"
-                bfig = px.bar(b_visible.sort_values("値"), x="値", y="指標", orientation="h", labels={"値": f"値（{b_unit_label}）", "指標": "用途・構造"})
-                bfig.update_layout(height=max(350, min(700, len(b_visible)*34)), margin=dict(l=5,r=8,t=8,b=5), showlegend=False)
+                scale_factor, display_unit = _chart_display_unit(b_visible["値"], b_unit_label)
+                b_visible["表示項目"] = b_visible["指標"].map(lambda value: _compact_category_label(value, max_chars=24))
+                b_visible["表示値"] = pd.to_numeric(b_visible["値"], errors="coerce") / scale_factor
+                bfig = px.bar(
+                    b_visible.sort_values("表示値"), x="表示値", y="表示項目", orientation="h",
+                    custom_data=["指標", "値"],
+                    labels={"表示値": f"値（{display_unit}）", "表示項目": "用途・構造"},
+                )
+                bfig.update_traces(
+                    hovertemplate="%{customdata[0]}<br>値：%{customdata[1]:,.0f} " + b_unit_label + "<extra></extra>"
+                )
+                bfig.update_xaxes(tickformat=",.0f", exponentformat="none", showexponent="none", separatethousands=True)
+                bfig.update_layout(
+                    height=max(380, min(720, len(b_visible) * 42)),
+                    margin=dict(l=12, r=24, t=12, b=16), showlegend=False,
+                    yaxis=dict(automargin=True, tickfont=dict(size=11)),
+                )
                 st.plotly_chart(bfig, use_container_width=True, config={"displayModeBar": False})
+                st.caption("構造名の略記：S造＝鉄骨造、RC造＝鉄筋コンクリート造、SRC造＝鉄骨鉄筋コンクリート造、CB造＝コンクリートブロック造。グラフにカーソルを合わせると正式な項目名を確認できます。")
                 building_specs = [{"title": f"建築物の用途・構造別比較（{b_year}年度）", "data": b_visible, "kind": "bar", "unit": b_unit_label}]
                 building_pdf_signature = f"{selected_region}|{start_year}|{end_year}|{b_year}|{b_unit_label}|{'|'.join(b_selected)}"
                 if st.session_state.get("building_pdf_signature") != building_pdf_signature:
