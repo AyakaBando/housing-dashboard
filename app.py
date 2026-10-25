@@ -275,20 +275,45 @@ PREF_ALIAS_PATTERN = re.compile(
 
 
 def match_prefecture(value):
-    """Fast normalization and canonicalization of Japanese prefecture labels."""
+    """Canonicalize prefecture names in both current and older e-Stat workbook layouts."""
     text = normalize_pref_name(value)
     if not text:
         return None
-    # Remove common leading regional codes, e.g. 02000青森 or 02青森.
+
+    # Normalize historical Excel labels such as "01北海道", "北海道計", or "北海道（01）".
     text = re.sub(r"^[0-9０-９]{1,5}", "", text)
     text = re.sub(r"^[(（]?[0-9０-９]{1,5}[)）]?", "", text)
+    text = re.sub(r"^(?:都道府県|地域|都道府県名)", "", text)
     text = re.sub(r"^[：:_-]+", "", text)
     if text in PREF_ALIAS_TO_CANONICAL:
         return PREF_ALIAS_TO_CANONICAL[text]
     match = PREF_ALIAS_PATTERN.fullmatch(text)
     if match:
         return PREF_ALIAS_TO_CANONICAL.get(match.group(1))
-    return None
+
+    # Some annual workbooks append total/area markers to the prefecture label.
+    # Accept only known suffixes to avoid treating arbitrary descriptions as a region.
+    allowed_suffix = r"(?:合計|計|管内|地区|地方|地域|都道府県|県内|府内|都内|道内|（計）|\(計\))"
+    for alias in sorted(PREF_ALIAS_TO_CANONICAL, key=len, reverse=True):
+        if not text.startswith(alias):
+            continue
+        suffix = text[len(alias):]
+        suffix = re.sub(r"^[（(]?[0-9０-９]{1,5}[）)]?$", "", suffix)
+        if not suffix or re.fullmatch(r"[0-9０-９()（）:：._-]*", suffix) or re.fullmatch(allowed_suffix, suffix):
+            return PREF_ALIAS_TO_CANONICAL[alias]
+    # Also accept a unique prefecture name embedded alongside a leading code/marker.
+    candidates = []
+    for alias in sorted(PREF_ALIAS_TO_CANONICAL, key=len, reverse=True):
+        start_at = text.find(alias)
+        if start_at < 0:
+            continue
+        prefix, suffix = text[:start_at], text[start_at + len(alias):]
+        clean_prefix = re.sub(r"^[0-9０-９()（）:：._-]*(?:都道府県|地域)?", "", prefix)
+        clean_suffix = re.sub(r"[0-9０-９()（）:：._-]*$", "", suffix)
+        if (not clean_prefix and (not clean_suffix or re.fullmatch(allowed_suffix, clean_suffix))):
+            candidates.append(PREF_ALIAS_TO_CANONICAL[alias])
+    candidates = list(dict.fromkeys(candidates))
+    return candidates[0] if len(candidates) == 1 else None
 
 
 
@@ -712,12 +737,14 @@ def parse_regional_metric_workbook(sheets, frequency="月次", dataset_name="e-S
 
         # Find both possible table orientations.
         pref_columns = []
-        for col_idx in range(min(12, df.shape[1])):
+        # Older annual Excel files may place region labels beyond column L.
+        for col_idx in range(df.shape[1]):
             cells = get_pref_cells_in_col(df, col_idx)
             if len(set(cells.values())) >= 10:
                 pref_columns.append((col_idx, cells))
         pref_rows = []
-        for row_idx in range(min(45, df.shape[0])):
+        # Do not assume the heading ends within the first 45 rows; annual tables vary by era.
+        for row_idx in range(df.shape[0]):
             cells = get_pref_cells_in_row(df, row_idx)
             if len(set(cells.values())) >= 10:
                 pref_rows.append((row_idx, cells))
@@ -726,7 +753,12 @@ def parse_regional_metric_workbook(sheets, frequency="月次", dataset_name="e-S
         row_best = max(pref_columns, key=lambda item: (len(set(item[1].values())), -item[0])) if pref_columns else None
         col_best = max(pref_rows, key=lambda item: (len(set(item[1].values())), -item[0])) if pref_rows else None
         if row_best is None and col_best is None:
-            debug.append(f"{sheet_name}: 都道府県ラベルを検出できない")
+            preview_rows = df.head(12).fillna("").astype(str).values.tolist()
+            preview_cols = df.iloc[:, :min(12, df.shape[1])].tail(12).fillna("").astype(str).values.tolist()
+            debug.append(
+                f"{sheet_name}: 都道府県ラベルを検出できない。先頭12行={preview_rows}; "
+                f"先頭12列の末尾12行={preview_cols}"
+            )
             continue
         if col_best is not None and (row_best is None or len(set(col_best[1].values())) > len(set(row_best[1].values()))):
             # Orientation B: prefecture names are column headers, categories are in rows.
@@ -836,6 +868,108 @@ def load_regional_source(list_url, include_terms, exclude_terms, frequency, data
     sheets = download_workbook(file_url)
     data = parse_regional_metric_workbook(sheets, frequency=frequency, dataset_name=dataset_name, default_unit=default_unit)
     return data, file_url, table_info
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def load_renovation_api_data(app_id: str) -> tuple[pd.DataFrame, str]:
+    """Fetch the e-Stat renovation reference table via its official API (requires free app ID)."""
+    if not app_id or not str(app_id).strip():
+        raise RuntimeError("ESTAT_APP_ID が設定されていません。")
+
+    api_url = "https://api.e-stat.go.jp/rest/2.1/app/json/getStatsData"
+    response = requests.get(
+        api_url,
+        params={"appId": str(app_id).strip(), "statsDataId": "0003360983", "lang": "J"},
+        headers=HEADERS,
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json().get("GET_STATS_DATA", {})
+    result = payload.get("RESULT", {}) or {}
+    if str(result.get("STATUS", "0")) != "0":
+        raise RuntimeError(f"e-Stat APIエラー: {result.get('ERROR_MSG', result)}")
+
+    statistical = payload.get("STATISTICAL_DATA", {}) or {}
+    class_inf = statistical.get("CLASS_INF", {}) or {}
+    class_objs = class_inf.get("CLASS_OBJ", [])
+    if isinstance(class_objs, dict):
+        class_objs = [class_objs]
+    class_maps = {}
+    class_names = {}
+    class_units = {}
+    for obj in class_objs:
+        dim_id = str(obj.get("@id", ""))
+        class_names[dim_id] = str(obj.get("@name", ""))
+        classes = obj.get("CLASS", [])
+        if isinstance(classes, dict):
+            classes = [classes]
+        mapping = {}
+        units = {}
+        for cls in classes:
+            code = str(cls.get("@code", ""))
+            mapping[code] = str(cls.get("@name", code))
+            if cls.get("@unit"):
+                units[code] = str(cls.get("@unit"))
+        class_maps[dim_id] = mapping
+        class_units[dim_id] = units
+
+    data_inf = statistical.get("DATA_INF", {}) or {}
+    values = data_inf.get("VALUE", [])
+    if isinstance(values, dict):
+        values = [values]
+    if not values:
+        raise RuntimeError("e-Stat APIから数値データが返されませんでした。統計表IDまたはAPI利用登録を確認してください。")
+
+    # Find region/time/use dimensions by their metadata, with code-name based fallbacks.
+    region_dim = next((k for k, n in class_names.items() if "施工地域" in n or "都道府県" in n or n == "地域"), None)
+    time_dim = next((k for k, n in class_names.items() if "時間軸" in n or "年度" in n or "年次" in n), None)
+    use_dim = next((k for k, n in class_names.items() if "用途" in n), None)
+    if region_dim is None:
+        region_dim = next((k for k, mp in class_maps.items() if sum(1 for v in mp.values() if v == "全国" or match_prefecture(v)) >= 10), None)
+    if time_dim is None:
+        time_dim = next((k for k, mp in class_maps.items() if any(parse_year_from_text(v) for v in mp.values())), None)
+    if use_dim is None:
+        use_dim = next((k for k, mp in class_maps.items() if any(v in {"計", "住宅", "非住宅建築物"} for v in mp.values())), None)
+    if region_dim is None or time_dim is None:
+        raise RuntimeError(f"e-Stat APIの分類情報から地域・時間軸を特定できません。分類={class_names}")
+
+    records = []
+    for item in values:
+        value = numeric_value(item.get("$"))
+        if value is None:
+            continue
+        attr = {str(k).lstrip("@"): str(v) for k, v in item.items() if str(k).startswith("@")}
+        region_name = class_maps.get(region_dim, {}).get(attr.get(region_dim, ""), "")
+        if region_name == "全国":
+            region = "全国"
+        else:
+            region = match_prefecture(region_name)
+        if region is None:
+            continue
+        time_name = class_maps.get(time_dim, {}).get(attr.get(time_dim, ""), "")
+        year = parse_year_from_text(time_name)
+        if year is None:
+            continue
+        if use_dim:
+            metric = class_maps.get(use_dim, {}).get(attr.get(use_dim, ""), "受注高")
+        else:
+            metric = "受注高"
+        unit = item.get("@unit", "") or "億円"
+        records.append({
+            "年月": pd.Timestamp(year=int(year), month=1, day=1),
+            "地域": region,
+            "指標": str(metric),
+            "値": value,
+            "単位": str(unit),
+            "頻度": "年次",
+            "出典": "e-Stat 建築物リフォーム・リニューアル調査（参考表2）",
+            "シート": "API取得",
+        })
+    if not records:
+        raise RuntimeError("e-Stat APIには接続できましたが、地域・年度別の受注高を抽出できませんでした。")
+
+    result_df = pd.DataFrame(records).drop_duplicates(subset=["年月", "地域", "指標"], keep="first")
+    return result_df.sort_values(["年月", "地域", "指標"]).reset_index(drop=True), ESTAT_RENOVATION_TABLE_URL
 
 
 def with_national_aggregate(data: pd.DataFrame) -> pd.DataFrame:
@@ -1267,6 +1401,244 @@ def create_multi_chart_pdf(title, region_label, period_label, specs):
     pdf.save()
     return out.getvalue()
 
+def prepare_overview_pdf_data(region_data, start_date, end_date, latest_month):
+    """Build the three standard overview charts for export independently of the visible tab."""
+    total_history = region_data[(region_data["指標"] == "住宅着工戸数") & (region_data["年月"].dt.date <= end_date)][["年月", "値"]].copy()
+    total_history["年月"] = pd.to_datetime(total_history["年月"])
+    total_history["値"] = pd.to_numeric(total_history["値"], errors="coerce")
+    total_history = total_history.dropna(subset=["値"]).sort_values("年月").drop_duplicates("年月", keep="last")
+    total_history["年度"] = total_history["年月"].dt.year.where(total_history["年月"].dt.month >= 4, total_history["年月"].dt.year - 1)
+    total_history["年度累計"] = total_history.groupby("年度")["値"].cumsum()
+    total_history["移動年計"] = total_history["値"].rolling(12, min_periods=12).sum()
+    trend_df = total_history[total_history["年月"].dt.date >= start_date].copy()
+    last_visible = total_history[total_history["年月"].dt.date <= end_date]
+    latest_fiscal_year = int(last_visible.iloc[-1]["年度"])
+    previous_fiscal_year = latest_fiscal_year - 1
+    compare_source = total_history.copy()
+    compare_source["月"] = compare_source["年月"].dt.month
+    month_order = [4,5,6,7,8,9,10,11,12,1,2,3]
+    compare_rows = []
+    for m in month_order:
+        prev_year = previous_fiscal_year if m >= 4 else previous_fiscal_year + 1
+        current_year = latest_fiscal_year if m >= 4 else latest_fiscal_year + 1
+        prev_row = compare_source[(compare_source["年月"].dt.year == prev_year) & (compare_source["月"] == m)]
+        cur_row = compare_source[(compare_source["年月"].dt.year == current_year) & (compare_source["月"] == m)]
+        compare_rows.append({"月ラベル": f"{m}月", "前年値": float(prev_row["値"].iloc[-1]) if not prev_row.empty else float("nan"),
+                             "最新年値": float(cur_row["値"].iloc[-1]) if not cur_row.empty else float("nan")})
+    compare_df = pd.DataFrame(compare_rows)
+    compare_df.attrs["前年ラベル"] = f"{previous_fiscal_year}年度"
+    compare_df.attrs["最新年ラベル"] = f"{latest_fiscal_year}年度"
+    composition_metrics = [("持家", "持家"), ("貸家", "貸家"), ("給与住宅", "給与住宅"),
+                           ("分譲：マンション", "分譲マンション（内数）"), ("分譲：戸建て", "分譲一戸建て（内数）")]
+    composition_rows = []
+    latest_rows = region_data[region_data["年月"] == latest_month]
+    for name, metric in composition_metrics:
+        values = pd.to_numeric(latest_rows.loc[latest_rows["指標"] == metric, "値"], errors="coerce").dropna()
+        if not values.empty and values.iloc[0] >= 0:
+            composition_rows.append({"表示名": name, "指標": metric, "値": float(values.iloc[0])})
+    return trend_df, compare_df, pd.DataFrame(composition_rows)
+
+
+def create_status_pdf(title, region_label, period_label, message, source_url=None):
+    """Make a transparent placeholder page when a source needs configuration or is unavailable."""
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfgen import canvas
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+    except Exception:
+        pass
+    width, height = landscape(A4)
+    output = io.BytesIO()
+    pdf = canvas.Canvas(output, pagesize=(width, height))
+    pdf.setTitle(title)
+    font = "HeiseiKakuGo-W5"
+    pdf.setFillColor(colors.HexColor("#263746")); pdf.setFont(font, 18)
+    pdf.drawString(32, height - 42, title)
+    pdf.setFont(font, 10); pdf.setFillColor(colors.HexColor("#64748b"))
+    pdf.drawString(32, height - 64, f"地域：{region_label}　対象期間：{period_label}")
+    pdf.setFillColor(colors.HexColor("#344054")); pdf.setFont(font, 12)
+    y = height - 112
+    for line in str(message).splitlines():
+        pdf.drawString(38, y, line[:100])
+        y -= 24
+        if y < 70:
+            break
+    if source_url:
+        pdf.setFillColor(colors.HexColor("#3478f6")); pdf.setFont(font, 8)
+        pdf.drawString(32, 35, f"出典ページ：{source_url[:130]}")
+    pdf.save(); output.seek(0)
+    return output.getvalue()
+
+
+def merge_pdf_documents(documents):
+    """Merge PDFs from every analysis screen into a single downloadable file."""
+    from pypdf import PdfWriter
+    import io
+    writer = PdfWriter()
+    for _title, pdf_bytes in documents:
+        if pdf_bytes:
+            writer.append(io.BytesIO(pdf_bytes))
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def regional_dataset_specs(raw_df, selected_region, start_date, end_date, title, default_keywords=(), max_metrics=8):
+    """Turn a parsed regional table into one time-series chart and one latest-period comparison."""
+    if raw_df is None or raw_df.empty:
+        return [], "データを抽出できませんでした。"
+    if selected_region == "全国":
+        regional = raw_df[raw_df["地域"] == "全国"].copy()
+        if regional.empty:
+            regional = with_national_aggregate(raw_df)
+            regional = regional[regional["地域"] == "全国"].copy()
+    else:
+        regional = raw_df[raw_df["地域"] == selected_region].copy()
+    regional = regional[(regional["年月"].dt.year >= start_date.year) & (regional["年月"].dt.year <= end_date.year)]
+    if regional.empty:
+        return [], "選択した地域・期間のデータがありません。"
+    units = regional["単位"].dropna().astype(str).unique().tolist()
+    if len(units) > 1:
+        # Avoid comparing different physical units on a shared axis: choose the most common unit.
+        unit = regional["単位"].astype(str).value_counts().index[0]
+        regional = regional[regional["単位"].astype(str) == unit].copy()
+    else:
+        unit = units[0] if units else "値"
+    labels = sorted(regional["指標"].dropna().astype(str).unique().tolist())
+    selected = choose_default_metrics(labels, max_metrics, default_keywords)
+    if not selected:
+        selected = labels[:max_metrics]
+    regional = regional[regional["指標"].isin(selected)].copy()
+    if regional.empty:
+        return [], "表示できる分類がありません。"
+    latest_time = regional["年月"].max()
+    latest = regional[regional["年月"] == latest_time].copy()
+    specs = [{"title": f"{title}（推移）", "data": regional[["年月", "指標", "値"]].copy(), "kind": "line", "unit": unit}]
+    if not latest.empty:
+        specs.append({"title": f"{title}（{latest_time.year}年・項目比較）", "data": latest[["指標", "値"]].copy(), "kind": "bar", "unit": unit})
+    return specs, ""
+
+
+def build_all_screens_pdf(region_label, selected_region, start_date, end_date, region_data, cards, latest_month, excel_url):
+    """Generate and merge the overview plus every detailed analysis screen into one PDF."""
+    documents = []
+    period_label = f"{start_date:%Y年%m月}～{end_date:%Y年%m月}"
+    notes = []
+    trend_df, compare_df, composition_df = prepare_overview_pdf_data(region_data, start_date, end_date, latest_month)
+    documents.append(("市場概況", create_dashboard_pdf(region_label, start_date, end_date, latest_month,
+                                                        cards, trend_df, compare_df, composition_df)))
+
+    # Screen 2: the seven monthly housing-start series, as displayed by the detailed screen.
+    detail_data = region_data[(region_data["年月"].dt.date >= start_date) & (region_data["年月"].dt.date <= end_date)].copy()
+    detail_metrics = ["住宅着工戸数", "持家", "貸家", "給与住宅", "分譲住宅", "分譲マンション（内数）", "分譲一戸建て（内数）"]
+    detail_specs = []
+    detail_value_mode = st.session_state.get("detail_value_mode", "着工戸数")
+    ycol = "値" if detail_value_mode == "着工戸数" else "前年比（％）"
+    for metric in detail_metrics:
+        subset = detail_data[detail_data["指標"] == metric].copy()
+        if ycol not in subset:
+            continue
+        subset[ycol] = pd.to_numeric(subset[ycol], errors="coerce")
+        subset = subset.dropna(subset=[ycol]).sort_values("年月")
+        if not subset.empty:
+            detail_specs.append({"title": metric, "data": subset[["年月", "指標", ycol]].rename(columns={ycol: "値"}),
+                                 "kind": "line", "unit": "戸" if ycol == "値" else "%"})
+    if detail_specs:
+        documents.append(("住宅着工の詳細", create_multi_chart_pdf(f"住宅着工の詳細（{detail_value_mode}）", region_label, period_label, detail_specs)))
+    else:
+        documents.append(("住宅着工の詳細", create_status_pdf("住宅着工の詳細", region_label, period_label, "選択期間の詳細データを取得できませんでした。", ESTAT_HOUSING_LIST_URL)))
+
+    # Screen 3: annual structure/use/house-type data.
+    try:
+        structure_raw, structure_file_url, _ = load_regional_source(
+            ESTAT_HOUSING_ANNUAL_URL, ("構造別", "建て方別", "都道府県別", "戸数"), (), "年次",
+            "e-Stat 住宅利用関係別・構造別・建て方別・都道府県別戸数", "戸")
+        specs, message = regional_dataset_specs(structure_raw, selected_region, start_date, end_date,
+                                                "住宅の構造・建て方・利用関係", ("木造", "鉄骨造", "鉄筋コンクリート", "鉄骨鉄筋", "共同住宅", "一戸建", "持家", "貸家"), 10)
+        if specs:
+            documents.append(("構造・建て方分析", create_multi_chart_pdf("構造・建て方分析", region_label, period_label + "（年次）", specs)))
+        else:
+            documents.append(("構造・建て方分析", create_status_pdf("構造・建て方分析", region_label, period_label, message, structure_file_url)))
+    except Exception as exc:
+        notes.append(f"構造・建て方分析：{exc}")
+        documents.append(("構造・建て方分析", create_status_pdf("構造・建て方分析", region_label, period_label,
+                                                                   "この統計表の自動取得または抽出に失敗しました。エラー詳細：" + str(exc)[:180], ESTAT_HOUSING_ANNUAL_URL)))
+
+    # Screen 4a: residential floor area.
+    try:
+        housing_area, housing_area_url, _ = load_regional_source(
+            ESTAT_HOUSING_LIST_URL, ("都道府県別床面積",), (), "月次", "e-Stat 住宅都道府県別床面積", "㎡")
+        specs, message = regional_dataset_specs(housing_area, selected_region, start_date, end_date,
+                                                "住宅の床面積", ("総数", "床面積", "持家", "貸家"), 6)
+        if specs:
+            documents.append(("住宅床面積", create_multi_chart_pdf("住宅の床面積", region_label, period_label, specs)))
+        else:
+            documents.append(("住宅床面積", create_status_pdf("住宅の床面積", region_label, period_label, message, housing_area_url)))
+    except Exception as exc:
+        notes.append(f"住宅床面積：{exc}")
+        documents.append(("住宅床面積", create_status_pdf("住宅の床面積", region_label, period_label,
+                                                           "この統計表の自動取得または抽出に失敗しました。" + str(exc)[:180], ESTAT_HOUSING_LIST_URL)))
+
+    # Screen 4b: building floor area.
+    try:
+        building_area, building_area_url, _ = load_regional_source(
+            ESTAT_BUILDING_MONTHLY_URL, ("都道府県別床面積",), (), "月次", "e-Stat 建築物都道府県別床面積", "㎡")
+        specs, message = regional_dataset_specs(building_area, selected_region, start_date, end_date,
+                                                "建築物の床面積", ("総数", "床面積", "用途"), 6)
+        if specs:
+            documents.append(("建築物床面積", create_multi_chart_pdf("建築物の床面積", region_label, period_label, specs)))
+        else:
+            documents.append(("建築物床面積", create_status_pdf("建築物の床面積", region_label, period_label, message, building_area_url)))
+    except Exception as exc:
+        notes.append(f"建築物床面積：{exc}")
+        documents.append(("建築物床面積", create_status_pdf("建築物の床面積", region_label, period_label,
+                                                             "この統計表の自動取得または抽出に失敗しました。" + str(exc)[:180], ESTAT_BUILDING_MONTHLY_URL)))
+
+    # Screen 4c: building usage/structure annual data.
+    try:
+        building_struct, building_struct_url, _ = load_regional_source(
+            ESTAT_BUILDING_ANNUAL_URL, ("構造別", "用途別", "都道府県別"), (), "年次",
+            "e-Stat 建築物構造別・用途別・都道府県別統計", "値")
+        specs, message = regional_dataset_specs(building_struct, selected_region, start_date, end_date,
+                                                "建築物の用途・構造", ("非住宅", "店舗", "事務所", "工場", "倉庫", "鉄骨", "鉄筋", "木造"), 10)
+        if specs:
+            documents.append(("建築物用途・構造", create_multi_chart_pdf("建築物の用途・構造", region_label, period_label + "（年次）", specs)))
+        else:
+            documents.append(("建築物用途・構造", create_status_pdf("建築物の用途・構造", region_label, period_label, message, building_struct_url)))
+    except Exception as exc:
+        notes.append(f"建築物用途・構造：{exc}")
+        documents.append(("建築物用途・構造", create_status_pdf("建築物の用途・構造", region_label, period_label,
+                                                                 "この統計表の自動取得または抽出に失敗しました。" + str(exc)[:180], ESTAT_BUILDING_ANNUAL_URL)))
+
+    # Screen 5: renovation regional reference data is a database table, not an Excel download.
+    try:
+        try:
+            estat_app_id = st.secrets.get("ESTAT_APP_ID", "")
+        except Exception:
+            estat_app_id = ""
+        if estat_app_id:
+            renovation, renovation_url = load_renovation_api_data(estat_app_id)
+            specs, message = regional_dataset_specs(renovation, selected_region, start_date, end_date,
+                                                    "リフォーム・リニューアル受注高", ("計", "住宅", "非住宅建築物"), 3)
+            if specs:
+                documents.append(("リフォーム市場", create_multi_chart_pdf("リフォーム・リニューアル市場", region_label, period_label + "（年次）", specs)))
+            else:
+                documents.append(("リフォーム市場", create_status_pdf("リフォーム市場", region_label, period_label, message, renovation_url)))
+        else:
+            note = "e-Statのこの統計表はデータベース形式です。自動取得には無料のe-Stat APIアプリケーションIDをStreamlit SecretsのESTAT_APP_IDに設定してください。"
+            documents.append(("リフォーム市場", create_status_pdf("リフォーム市場", region_label, period_label, note, ESTAT_RENOVATION_TABLE_URL)))
+    except Exception as exc:
+        notes.append(f"リフォーム市場：{exc}")
+        documents.append(("リフォーム市場", create_status_pdf("リフォーム市場", region_label, period_label,
+                                                               "e-Stat APIからデータを取得できませんでした。" + str(exc)[:180], ESTAT_RENOVATION_TABLE_URL)))
+
+    return merge_pdf_documents(documents), notes
+
+
 st.set_page_config(page_title="住宅着工統計ダッシュボード", page_icon="📊", layout="wide")
 st.markdown("""
 <style>
@@ -1407,6 +1779,40 @@ for label, metric, accent in card_metrics:
     yoy_text = f"{ratio:.1f}%" if ratio is not None else "—"
     yoy_color = "#d92d20" if ratio is not None and ratio > 100 else "#1570ef" if ratio is not None else "#667085"
     cards.append({"label": label, "metric": metric, "color": accent, "value": value_text, "previous": previous_text, "yoy": yoy_text, "yoy_color": yoy_color, "current": current, "previous_value": previous, "ratio": ratio})
+
+# Combined PDF export is available from every analysis screen, and includes all 5 screens.
+combined_signature = f"{selected_region}|{start_date}|{end_date}|{latest_month}"
+if st.session_state.get("all_screens_pdf_signature") != combined_signature:
+    st.session_state.pop("all_screens_pdf_bytes", None)
+    st.session_state.pop("all_screens_pdf_signature", None)
+with st.container(border=True):
+    st.markdown("**PDFレポート**")
+    st.caption("市場概況・住宅着工の詳細・構造／建て方・建築規模／非住宅・リフォーム市場を1つのPDFにまとめます。")
+    if st.button("全分析画面を1つのPDFにまとめる", type="primary", key="all_screens_pdf_button"):
+        try:
+            with st.spinner("全分析画面のデータとグラフをまとめています。初回は取得に時間がかかる場合があります..."):
+                all_pdf, pdf_notes = build_all_screens_pdf(
+                    region_label, selected_region, start_date, end_date, region_data, cards, latest_month, excel_url)
+            st.session_state["all_screens_pdf_bytes"] = all_pdf
+            st.session_state["all_screens_pdf_signature"] = combined_signature
+            st.session_state["all_screens_pdf_notes"] = pdf_notes
+        except Exception as exc:
+            st.error("一括PDFの作成に失敗しました。")
+            st.code(str(exc))
+    if st.session_state.get("all_screens_pdf_signature") == combined_signature and st.session_state.get("all_screens_pdf_bytes"):
+        safe_region = re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龠_-]+", "_", selected_region)
+        st.download_button(
+            "全分析画面をまとめたPDFをダウンロード",
+            st.session_state["all_screens_pdf_bytes"],
+            file_name=f"住宅市場分析_全画面_{safe_region}_{start_date:%Y%m}_{end_date:%Y%m}.pdf",
+            mime="application/pdf", key="all_screens_pdf_download", use_container_width=True)
+        notes = st.session_state.get("all_screens_pdf_notes", [])
+        if notes:
+            with st.expander("PDFに含まれる取得状況"):
+                st.write("一部の統計表を取得できなかったため、該当ページには出典と状況を記載しています。")
+                for note in notes:
+                    st.write(f"- {note}")
+
 
 if analysis_view == "市場概況":
     # KPI row similar to the supplied design reference.
@@ -1770,63 +2176,77 @@ elif analysis_view == "建築規模・非住宅":
 
 elif analysis_view == "リフォーム市場":
     st.markdown(f"### {region_label}　リフォーム市場")
-    st.caption("国土交通省の建築物リフォーム・リニューアル調査のうち、施工地域（都道府県）別の参考表を表示します。")
+    st.caption("e-Statの施工地域別受注高を表示します。この統計表は参考表です。")
     try:
-        with st.spinner("e-Statから施工地域別の受注高統計を取得しています..."):
-            renovation_raw, renovation_file_url, renovation_info = load_regional_source(
-                ESTAT_RENOVATION_URL, ("施工地域別", "受注高"), (), "年次",
-                "e-Stat 建築物リフォーム・リニューアル調査 施工地域別受注高", "億円")
-        renovation_raw = with_national_aggregate(renovation_raw)
-        renovation_region = renovation_raw[renovation_raw["地域"] == selected_region].copy()
-        renovation_region = renovation_region[(renovation_region["年月"].dt.year >= start_year) & (renovation_region["年月"].dt.year <= end_year)]
-        if renovation_region.empty:
-            st.info("選択した地域・期間に該当するリフォーム市場データはありません。")
+        try:
+            estat_app_id = st.secrets.get("ESTAT_APP_ID", "")
+        except Exception:
+            estat_app_id = ""
+        if not estat_app_id:
+            st.info(
+                "この統計はe-Statのデータベース形式で公開されており、Excel一覧からの直接取得には対応していません。"
+                "自動取得には無料のe-Stat APIアプリケーションIDが必要です。"
+            )
+            st.markdown(f"[e-Statの施工地域別受注高を開く]({ESTAT_RENOVATION_TABLE_URL})")
+            with st.expander("自動取得の設定方法"):
+                st.markdown(
+                    "1. [e-Stat API](https://www.e-stat.go.jp/api/) で利用登録し、アプリケーションIDを取得します。\n"
+                    "2. Streamlit Community Cloud の App settings → Secrets に `ESTAT_APP_ID = \\\"取得したID\\\"` を追加します。\n"
+                    "3. アプリを再起動すると、この画面で受注高のグラフを取得できます。"
+                )
         else:
-            years = sorted(renovation_region["年月"].dt.year.unique().tolist())
-            selected_renovation_year = st.selectbox("対象年", years, index=len(years)-1,
-                                                    format_func=lambda y: f"{y}年", key="renovation_year")
-            latest_reno = renovation_region[renovation_region["年月"].dt.year == selected_renovation_year]
-            labels = sorted(latest_reno["指標"].astype(str).unique().tolist())
-            defaults = choose_default_metrics(labels, 8, ("住宅", "非住宅", "計"))
-            reno_selected = st.multiselect("比較する項目", labels, default=defaults, key="renovation_metrics")
-            visible = latest_reno[latest_reno["指標"].isin(reno_selected)]
-            if not visible.empty:
-                reno_fig = px.bar(visible.sort_values("値"), x="値", y="指標", orientation="h",
-                                  labels={"値": f"受注高（{visible['単位'].iloc[0]}）", "指標": "工事区分"})
-                reno_fig.update_layout(height=max(300, min(650, 38*len(visible))), margin=dict(l=5,r=8,t=8,b=5), showlegend=False)
-                st.plotly_chart(reno_fig, use_container_width=True, config={"displayModeBar": False})
-            if renovation_region["年月"].dt.year.nunique() > 1 and reno_selected:
-                reno_trend = renovation_region[renovation_region["指標"].isin(reno_selected)]
-                rtfig = px.line(reno_trend, x="年月", y="値", color="指標", markers=True,
-                                labels={"年月": "年度", "値": "受注高", "指標": "工事区分"})
-                rtfig.update_layout(height=330, margin=dict(l=5,r=8,t=8,b=5))
-                rtfig.update_xaxes(tickformat="%Y年")
-                st.plotly_chart(rtfig, use_container_width=True, config={"displayModeBar": False})
-            specs = [{"title": f"施工地域別受注高（{selected_renovation_year}年）", "data": visible, "kind": "bar", "unit": visible["単位"].iloc[0] if not visible.empty else "億円"}]
-            if renovation_region["年月"].dt.year.nunique() > 1 and reno_selected:
-                specs.append({"title": "施工地域別受注高の推移", "data": renovation_region[renovation_region["指標"].isin(reno_selected)], "kind": "line", "unit": "億円"})
-            renovation_pdf_signature = f"{selected_region}|{start_year}|{end_year}|{selected_renovation_year}|{'|'.join(reno_selected)}"
-            if st.session_state.get("renovation_pdf_signature") != renovation_pdf_signature:
-                st.session_state.pop("renovation_pdf_bytes", None)
-                st.session_state.pop("renovation_pdf_signature", None)
-            if st.button("リフォーム市場をPDFに出力", type="primary", key="renovation_pdf_button"):
-                try:
-                    st.session_state["renovation_pdf_bytes"] = create_multi_chart_pdf(
-                        "リフォーム・リニューアル市場", region_label,
-                        f"{start_year}年～{end_year}年", specs)
-                    st.session_state["renovation_pdf_signature"] = renovation_pdf_signature
-                except Exception as exc:
-                    st.error(f"PDFの作成に失敗しました: {exc}")
-            if st.session_state.get("renovation_pdf_signature") == renovation_pdf_signature and st.session_state.get("renovation_pdf_bytes"):
-                st.download_button("リフォーム市場PDFをダウンロード", st.session_state["renovation_pdf_bytes"],
-                                   file_name=f"リフォーム市場_{region_label}.pdf", mime="application/pdf", key="renovation_pdf_download")
-        with st.expander("データ出典・調査上の位置づけ"):
-            st.markdown(f"[e-Statの施工地域別受注高・年度次統計表]({ESTAT_RENOVATION_TABLE_URL})")
-            st.markdown(f"[リフォーム統計の公開ファイル一覧]({ESTAT_RENOVATION_URL})")
-            st.markdown(f"[今回アプリが取得したExcelを開く]({renovation_file_url})")
-            st.caption("この地域別表は参考表です。調査対象者を地域別に抽出したものではないため、都道府県別の推定誤差に注意して利用してください。")
+            with st.spinner("e-Stat APIからリフォーム市場データを取得しています..."):
+                renovation_raw, renovation_source_url = load_renovation_api_data(estat_app_id)
+            renovation_region = renovation_raw[renovation_raw["地域"] == selected_region].copy()
+            renovation_region = renovation_region[
+                (renovation_region["年月"].dt.year >= start_year) & (renovation_region["年月"].dt.year <= end_year)
+            ]
+            if renovation_region.empty:
+                st.info("選択した地域・期間に該当するリフォーム市場データはありません。")
+            else:
+                years = sorted(renovation_region["年月"].dt.year.unique().tolist())
+                selected_renovation_year = st.selectbox(
+                    "対象年度", years, index=len(years)-1, format_func=lambda y: f"{y}年度", key="renovation_year")
+                latest_reno = renovation_region[renovation_region["年月"].dt.year == selected_renovation_year]
+                labels = sorted(latest_reno["指標"].astype(str).unique().tolist())
+                defaults = choose_default_metrics(labels, 3, ("計", "住宅", "非住宅建築物"))
+                reno_selected = st.multiselect("比較する項目", labels, default=defaults, key="renovation_metrics")
+                visible = latest_reno[latest_reno["指標"].isin(reno_selected)]
+                if not visible.empty:
+                    reno_fig = px.bar(visible.sort_values("値"), x="値", y="指標", orientation="h",
+                                      labels={"値": f"受注高（{visible['単位'].iloc[0]}）", "指標": "用途"})
+                    reno_fig.update_layout(height=max(300, min(650, 38*len(visible))), margin=dict(l=5,r=8,t=8,b=5), showlegend=False)
+                    st.plotly_chart(reno_fig, use_container_width=True, config={"displayModeBar": False})
+                if renovation_region["年月"].dt.year.nunique() > 1 and reno_selected:
+                    reno_trend = renovation_region[renovation_region["指標"].isin(reno_selected)]
+                    rtfig = px.line(reno_trend, x="年月", y="値", color="指標", markers=True,
+                                    labels={"年月": "年度", "値": "受注高", "指標": "用途"})
+                    rtfig.update_layout(height=330, margin=dict(l=5,r=8,t=8,b=5))
+                    rtfig.update_xaxes(tickformat="%Y年")
+                    st.plotly_chart(rtfig, use_container_width=True, config={"displayModeBar": False})
+                specs = [{"title": f"施工地域別受注高（{selected_renovation_year}年度）", "data": visible, "kind": "bar", "unit": visible["単位"].iloc[0] if not visible.empty else "億円"}]
+                if renovation_region["年月"].dt.year.nunique() > 1 and reno_selected:
+                    specs.append({"title": "施工地域別受注高の推移", "data": renovation_region[renovation_region["指標"].isin(reno_selected)], "kind": "line", "unit": "億円"})
+                renovation_pdf_signature = f"{selected_region}|{start_year}|{end_year}|{selected_renovation_year}|{'|'.join(reno_selected)}"
+                if st.session_state.get("renovation_pdf_signature") != renovation_pdf_signature:
+                    st.session_state.pop("renovation_pdf_bytes", None)
+                    st.session_state.pop("renovation_pdf_signature", None)
+                if st.button("リフォーム市場をPDFに出力", type="primary", key="renovation_pdf_button"):
+                    try:
+                        st.session_state["renovation_pdf_bytes"] = create_multi_chart_pdf(
+                            "リフォーム・リニューアル市場", region_label,
+                            f"{start_year}年度～{end_year}年度", specs)
+                        st.session_state["renovation_pdf_signature"] = renovation_pdf_signature
+                    except Exception as exc:
+                        st.error(f"PDFの作成に失敗しました: {exc}")
+                if st.session_state.get("renovation_pdf_signature") == renovation_pdf_signature and st.session_state.get("renovation_pdf_bytes"):
+                    st.download_button("リフォーム市場PDFをダウンロード", st.session_state["renovation_pdf_bytes"],
+                                       file_name=f"リフォーム市場_{region_label}.pdf", mime="application/pdf", key="renovation_pdf_download")
+            with st.expander("データ出典"):
+                st.markdown(f"[e-Statの施工地域別受注高（参考表2）]({ESTAT_RENOVATION_TABLE_URL})")
+                st.caption("この地域別表は参考表です。調査対象者を地域別に抽出していないため、数値は参考として扱ってください。")
     except Exception as exc:
-        st.error("施工地域別のリフォーム統計を読み込めませんでした。住宅着工の画面は引き続き利用できます。")
+        st.error("e-Stat APIからリフォーム統計を取得できませんでした。ほかの分析画面は引き続き利用できます。")
         with st.expander("エラー詳細"):
             st.code(str(exc))
-        st.markdown(f"[e-Statのリフォーム統計一覧を開く]({ESTAT_RENOVATION_URL})")
+        st.markdown(f"[e-Statの施工地域別受注高（参考表2）を開く]({ESTAT_RENOVATION_TABLE_URL})")

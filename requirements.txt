@@ -9,3 +9,4 @@ matplotlib>=3.7
 reportlab>=4.0
 groq>=0.11
 matplotlib-fontja>=1.1.0
+pypdf>=5.0
