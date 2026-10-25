@@ -417,87 +417,75 @@ def find_total_count_column(df: pd.DataFrame, prefecture_col: int) -> int:
 
 
 def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Parse e-Stat workbook: one worksheet per month, prefecture labels in column B, total in C."""
+    """Parse monthly e-Stat workbook into a long regional dataset with all use/housing-type metrics."""
     records = []
     sheet_debug = []
+    # The main table has paired value / year-on-year columns, documented by the sample workbook:
+    # C/D=total, E/F=owner-occupied, G/H=rental, I/J=company-owned, K/L=for-sale,
+    # M/N=condominiums within for-sale, O/P=detached houses within for-sale.
+    metrics = [
+        ("住宅着工戸数", 2, 3),
+        ("持家", 4, 5),
+        ("貸家", 6, 7),
+        ("給与住宅", 8, 9),
+        ("分譲住宅", 10, 11),
+        ("分譲マンション（内数）", 12, 13),
+        ("分譲一戸建て（内数）", 14, 15),
+    ]
 
     for sheet_name, raw in sheets.items():
         if raw is None or raw.empty:
             continue
         df = raw.copy().reset_index(drop=True)
-        # Normalize ordinary text whitespace; NFKC handling is done when matching prefecture names.
         df = df.apply(lambda column: column.map(lambda x: x.strip() if isinstance(x, str) else x))
         month = parse_month_from_sheet(sheet_name, df)
         if month is None:
             sheet_debug.append(f"シート「{sheet_name}」: タイトル・シート名から年月を特定できません")
             continue
 
-        # Search the left-side main table. Do not require 10+ matches: some valid sheets
-        # may contain fewer rows, and a valid prefecture cell is sufficient evidence.
         prefecture_candidates = []
         for col_idx in range(min(8, df.shape[1])):
             hits = get_pref_cells_in_col(df, col_idx)
             if hits:
                 prefecture_candidates.append((col_idx, hits))
-
+        if not prefecture_candidates and df.shape[1] > 1:
+            fallback_hits = get_pref_cells_in_col(df, 1)
+            if fallback_hits:
+                prefecture_candidates.append((1, fallback_hits))
         if not prefecture_candidates:
-            # The observed e-Stat table places prefecture names in column B (index 1).
-            # Retry the known prefecture column explicitly before declaring extraction failure.
-            if df.shape[1] > 1:
-                fallback_hits = get_pref_cells_in_col(df, 1)
-                if fallback_hits:
-                    prefecture_candidates.append((1, fallback_hits))
-
-        if not prefecture_candidates:
-            # Diagnostic: show what Excel actually contains in the candidate columns.
-            samples = []
-            for col_idx in range(min(4, df.shape[1])):
-                values = [normalize_pref_name(v) for v in df.iloc[:, col_idx].tolist() if normalize_pref_name(v)]
-                samples.append(f"列{col_idx + 1}={values[:12]}")
-            sheet_debug.append(
-                f"シート「{sheet_name}」: 都道府県名の列を特定できません（" + "; ".join(samples) + "）"
-            )
+            sheet_debug.append(f"シート「{sheet_name}」: 都道府県名の列を特定できません")
             continue
 
-        # Prefer the column with the greatest number of distinct prefectures; in ties,
-        # prefer the leftmost column, which is the main data table, not the auxiliary table.
+        # Prefer the left-most column with the most regional labels (the primary table).
         prefecture_col, prefecture_rows = max(
             prefecture_candidates,
             key=lambda item: (len(set(item[1].values())), -item[0]),
         )
-
-        try:
-            total_col = find_total_count_column(df, prefecture_col)
-        except RuntimeError as exc:
-            # In the known e-Stat sheet, column C (index 2) is the left-side 総数 / 戸数.
-            if df.shape[1] > prefecture_col + 1:
-                total_col = prefecture_col + 1
-            else:
-                sheet_debug.append(f"シート「{sheet_name}」: {exc}")
-                continue
-
         rows_added = 0
         for row_idx, prefecture in prefecture_rows.items():
-            if row_idx < 5 or row_idx >= df.shape[0] or total_col >= df.shape[1]:
+            if row_idx < 5 or row_idx >= df.shape[0]:
                 continue
-            value = numeric_value(df.iat[row_idx, total_col])
-            if value is None:
-                continue
-            records.append({
-                "年月": month,
-                "地域": prefecture,
-                "指標": "住宅着工戸数",
-                "値": value,
-                "単位": "戸",
-                "出典": "e-Stat 建築着工統計調査",
-                "シート": str(sheet_name),
-            })
-            rows_added += 1
-
+            for metric_name, value_col, yoy_col in metrics:
+                if value_col >= df.shape[1]:
+                    continue
+                value = numeric_value(df.iat[row_idx, value_col])
+                yoy = numeric_value(df.iat[row_idx, yoy_col]) if yoy_col < df.shape[1] else None
+                if value is None:
+                    continue
+                records.append({
+                    "年月": month,
+                    "地域": prefecture,
+                    "指標": metric_name,
+                    "値": value,
+                    "前年比（％）": yoy,
+                    "単位": "戸",
+                    "頻度": "月次",
+                    "出典": "e-Stat 建築着工統計調査 / 住宅・都道府県別着工戸数",
+                    "シート": str(sheet_name),
+                })
+                rows_added += 1
         if rows_added == 0:
-            sheet_debug.append(
-                f"シート「{sheet_name}」: 都道府県名は検出しましたが、戸数列（列{total_col + 1}）に数値がありません"
-            )
+            sheet_debug.append(f"シート「{sheet_name}」: 都道府県行から数値を抽出できませんでした")
 
     if not records:
         previews = []
@@ -505,27 +493,49 @@ def parse_prefecture_timeseries(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame
             if df is not None:
                 preview = df.head(6).fillna("").astype(str).values.tolist()
                 previews.append(f"シート「{name}」の先頭6行: {preview}")
-        diagnostic = "\n".join(sheet_debug[:10] + previews)
         raise RuntimeError(
             "Excelファイルは取得できましたが、都道府県別の住宅着工戸数を抽出できませんでした。\n"
-            + diagnostic
+            + "\n".join(sheet_debug[:10] + previews)
         )
 
     result = pd.DataFrame(records)
     result["年月"] = pd.to_datetime(result["年月"])
     result = result.drop_duplicates(subset=["年月", "地域", "指標"], keep="first")
     result = result[result["値"].notna()]
-    result = result.sort_values(["年月", "地域"]).reset_index(drop=True)
-    return result
+    return result.sort_values(["年月", "地域", "指標"]).reset_index(drop=True)
 
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def load_estat_data() -> tuple[pd.DataFrame, str, str]:
-    """取得・Excel解析をキャッシュし、UI操作のたびに繰り返さない。"""
+    """Cache list-page fetch + Excel download + parsing for six hours."""
     excel_url, dataset_info = fetch_excel_link()
     sheets = download_workbook(excel_url)
     data = parse_prefecture_timeseries(sheets)
     return data, excel_url, dataset_info
+
+
+def build_national_series(data: pd.DataFrame) -> pd.DataFrame:
+    """Build a national aggregate from all available prefectural rows.
+
+    Counts are summed. National year-over-year percentage is calculated from the
+    national metric total, rather than summing/averaging prefectural percentages.
+    """
+    aggregated = (
+        data.groupby(["年月", "指標"], as_index=False)
+        .agg(値=("値", "sum"), 集計対象都道府県数=("地域", "nunique"))
+        .sort_values(["指標", "年月"])
+    )
+    # Never present a partial sum as the national value.
+    aggregated.loc[aggregated["集計対象都道府県数"] != len(PREFECTURES), "値"] = float("nan")
+    aggregated["前年比（％）"] = aggregated.groupby("指標")["値"].transform(
+        lambda series: (series / series.shift(12) - 1) * 100
+    )
+    aggregated["地域"] = "全国"
+    aggregated["単位"] = "戸"
+    aggregated["頻度"] = "月次"
+    aggregated["出典"] = "e-Stat 都道府県別データから47都道府県を合計"
+    aggregated["シート"] = "全国集計"
+    return aggregated
 
 
 def analyze_with_groq(data: pd.DataFrame, api_key: str, model: str) -> str:
@@ -555,11 +565,11 @@ def analyze_with_groq(data: pd.DataFrame, api_key: str, model: str) -> str:
 
 st.set_page_config(page_title="住宅着工統計ダッシュボード", page_icon="📊", layout="wide")
 st.title("住宅着工統計ダッシュボード")
-st.caption("e-Statの公開Excelを自動取得して表示します。")
+st.caption("e-Statの公開Excelを自動取得。地域を選ぶと、その地域のデータだけを全画面に反映します。")
 
 with st.sidebar:
-    st.header("表示設定")
-    if st.button("e-Statからデータを再取得", use_container_width=True, help="保存済みキャッシュを削除し、e-StatからExcelを取り直します。"):
+    st.header("① 地域を選択")
+    if st.button("e-Statからデータを再取得", use_container_width=True, help="キャッシュを削除し、次回の実行でExcelを取り直します。"):
         st.cache_data.clear()
         st.rerun()
 
@@ -571,9 +581,6 @@ except Exception as exc:
     st.markdown("**エラーの詳細**")
     st.code(str(exc))
     st.markdown(f"[e-Statの住宅着工統計一覧を開く]({ESTAT_HOUSING_LIST_URL})")
-    st.markdown(
-        "このエラー表示をそのままコピーして共有すると、次の修正箇所を特定できます。"
-    )
     st.stop()
 
 data["年月"] = pd.to_datetime(data["年月"])
@@ -581,112 +588,136 @@ min_month = data["年月"].min()
 max_month = data["年月"].max()
 min_date = min_month.date()
 max_date = max_month.date()
-
-# Step 1: Select the prefectures first. Do not preselect every prefecture.
-with st.sidebar:
-    st.subheader("① 表示する都道府県")
-    regions = st.multiselect(
-        "都道府県を選択してください（複数選択可）",
-        options=PREFECTURES,
-        default=[],
-        key="selected_prefectures",
-        help="選択した都道府県のデータだけをグラフ・集計・表に表示します。",
-    )
-
-if not regions:
-    st.info("まず、画面左側の「① 表示する都道府県」から表示したい都道府県を選択してください。")
-    st.stop()
-
-# Avoid silently presenting partial results if a selected region was not extracted.
 available_regions = set(data["地域"].dropna().unique().tolist())
-missing_regions = [region for region in regions if region not in available_regions]
-if missing_regions:
-    st.error(
-        "選択した都道府県のデータが、取得したExcelから抽出できていません。"
-        f" 選択中：{', '.join(regions)}。"
-        f" 抽出できている都道府県：{', '.join(sorted(available_regions)) or 'なし'}。"
+region_options = ["全国"] + [p for p in PREFECTURES if p in available_regions]
+
+with st.sidebar:
+    selected_region = st.selectbox(
+        "全国または都道府県",
+        options=region_options,
+        index=None,
+        placeholder="地域を選択してください",
+        key="region_selector",
+        help="全国を選ぶと、取得した47都道府県の値を合計します。都道府県を選ぶと、その都道府県だけを表示します。",
     )
-    st.info(
-        "この状態では、データがない都道府県を含めたまま誤った集計を表示しないよう、"
-        "グラフ等を表示していません。"
-    )
+
+if selected_region is None:
+    st.info("まず、画面左側から「全国」または表示したい都道府県を選択してください。")
     st.stop()
 
-# Step 2: Set the period and chart options after prefecture selection.
+if selected_region == "全国":
+    region_data = build_national_series(data)
+else:
+    region_data = data.loc[data["地域"] == selected_region].copy()
+    if region_data.empty:
+        st.error(f"{selected_region}のデータを取得できていません。データ抽出状況を確認してください。")
+        st.stop()
+
+metrics = [
+    "住宅着工戸数", "持家", "貸家", "給与住宅", "分譲住宅",
+    "分譲マンション（内数）", "分譲一戸建て（内数）",
+]
+available_metrics = [m for m in metrics if m in region_data["指標"].unique()]
+if not available_metrics:
+    st.error("選択した地域で表示できる指標がありません。")
+    st.stop()
+
 with st.sidebar:
     st.divider()
-    st.subheader("② 表示期間・形式")
+    st.header("② 指標・期間を選択")
+    selected_metric = st.selectbox("指標", available_metrics, index=0)
+    display_measure = st.radio("表示内容", ["着工戸数（戸）", "前年比（％）"], horizontal=False)
     start_date = st.date_input("開始月", value=min_date, min_value=min_date, max_value=max_date)
     end_date = st.date_input("終了月", value=max_date, min_value=min_date, max_value=max_date)
-    chart_type = st.selectbox("推移グラフ", ["折れ線", "棒", "面"])
+    chart_type = st.selectbox("グラフ形式", ["折れ線", "棒", "面"])
     show_table = st.checkbox("データ表を表示", value=True)
 
 if start_date > end_date:
     st.error("開始月は終了月以前の日付を指定してください。")
     st.stop()
 
-filtered = data[
-    (data["年月"].dt.date >= start_date)
-    & (data["年月"].dt.date <= end_date)
-    & (data["地域"].isin(regions))
-].copy()
-
+filtered = region_data[
+    (region_data["指標"] == selected_metric)
+    & (region_data["年月"].dt.date >= start_date)
+    & (region_data["年月"].dt.date <= end_date)
+].copy().sort_values("年月")
 if filtered.empty:
-    st.warning("選択した都道府県・期間に該当するデータがありません。")
+    st.warning("選択した地域・指標・期間に該当するデータがありません。")
     st.stop()
 
-latest_month = filtered["年月"].max()
-latest_total = filtered.loc[filtered["年月"] == latest_month, "値"].sum()
-months = sorted(filtered["年月"].drop_duplicates())
-prev_total = None
-if len(months) >= 2:
-    prev_total = filtered.loc[filtered["年月"] == months[-2], "値"].sum()
+if selected_region == "全国":
+    region_label = "全国（47都道府県合計）"
+else:
+    region_label = selected_region
+
+value_col = "値" if display_measure == "着工戸数（戸）" else "前年比（％）"
+filtered = filtered[filtered[value_col].notna()].copy()
+if filtered.empty:
+    st.warning(f"選択した期間では「{display_measure}」を表示できるデータがありません。")
+    st.stop()
+
+latest_row = filtered.iloc[-1]
+latest_month = pd.Timestamp(latest_row["年月"])
+latest_value = float(latest_row[value_col])
+metric_label = "戸" if value_col == "値" else "%"
+prev_rows = filtered[filtered["年月"] < latest_month]
+month_delta = None
+if not prev_rows.empty:
+    month_delta = latest_value - float(prev_rows.iloc[-1][value_col])
 
 c1, c2, c3 = st.columns(3)
-c1.metric("表示対象の最新月", latest_month.strftime("%Y年%m月"))
-c2.metric("最新月の合計", f"{latest_total:,.0f} 戸")
-if prev_total is not None:
-    c3.metric("前月比（選択地域合計）", f"{latest_total - prev_total:+,.0f} 戸")
-else:
-    c3.metric("表示地域数", f"{filtered['地域'].nunique()}")
+c1.metric("表示対象", region_label)
+c2.metric("最新月", latest_month.strftime("%Y年%m月"))
+c3.metric(f"最新値（{display_measure}）", f"{latest_value:,.1f} {metric_label}" if value_col != "値" else f"{latest_value:,.0f} {metric_label}")
 
-st.subheader("住宅着工戸数の推移")
+st.subheader(f"{region_label}｜{selected_metric}の推移")
+plot_df = filtered.copy()
+plot_df["グラフ値"] = plot_df[value_col]
 if chart_type == "棒":
-    fig = px.bar(filtered, x="年月", y="値", color="地域", barmode="group",
-                 labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
+    fig = px.bar(plot_df, x="年月", y="グラフ値", labels={"年月": "年月", "グラフ値": display_measure})
 elif chart_type == "面":
-    fig = px.area(filtered, x="年月", y="値", color="地域",
-                  labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
+    fig = px.area(plot_df, x="年月", y="グラフ値", labels={"年月": "年月", "グラフ値": display_measure})
 else:
-    fig = px.line(filtered, x="年月", y="値", color="地域", markers=False,
-                  labels={"年月": "年月", "値": "戸数", "地域": "都道府県"})
-fig.update_layout(legend_title_text="都道府県", xaxis_title="年月", yaxis_title="住宅着工戸数（戸）")
+    fig = px.line(plot_df, x="年月", y="グラフ値", markers=False, labels={"年月": "年月", "グラフ値": display_measure})
+fig.update_layout(xaxis_title="年月", yaxis_title=display_measure)
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("選択した都道府県の最新月比較")
-latest = filtered[filtered["年月"] == latest_month].sort_values("値", ascending=False)
-compare_fig = px.bar(latest, x="地域", y="値",
-                     labels={"地域": "都道府県", "値": "住宅着工戸数（戸）"})
-compare_fig.update_layout(xaxis_title="", yaxis_title="住宅着工戸数（戸）")
-st.plotly_chart(compare_fig, use_container_width=True)
+if value_col == "値":
+    yoy_value = latest_row.get("前年比（％）")
+    # For national totals the value is calculated from prefectural sums; its YoY is computed from that sum.
+    if pd.notna(yoy_value):
+        st.metric("前年同月比", f"{float(yoy_value):+.1f}%")
+    else:
+        st.caption("前年同月比は比較対象月がないため表示していません。")
+else:
+    st.caption("前年比は、原則としてe-Stat公表表の同月比を表示します。全国では47都道府県合計から算出しています。")
+
+if selected_metric in {"分譲マンション（内数）", "分譲一戸建て（内数）"}:
+    st.caption("※「内数」は分譲住宅の内訳です。分譲住宅の総数と加算しないでください。")
 
 if show_table:
     st.subheader("データ一覧")
-    table = filtered.sort_values(["年月", "地域"], ascending=[False, True]).copy()
+    table = filtered[["年月", "地域", "指標", "値", "前年比（％）", "単位", "頻度", "出典"]].copy()
     table["年月"] = table["年月"].dt.strftime("%Y-%m")
-    st.dataframe(table[["年月", "地域", "値", "単位", "出典"]], use_container_width=True, hide_index=True)
+    st.dataframe(table.sort_values("年月", ascending=False), use_container_width=True, hide_index=True)
 
 csv_bytes = filtered.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-st.download_button("表示データをCSVでダウンロード", csv_bytes,
-                   "housing_starts_estat.csv", "text/csv")
+st.download_button(
+    "表示データをCSVでダウンロード",
+    data=csv_bytes,
+    file_name=f"housing_starts_{selected_region}_{selected_metric}.csv",
+    mime="text/csv",
+)
 
 with st.expander("データ取得情報"):
     st.write("取得元：e-Stat「建築着工統計調査 / 住宅着工統計 / 時系列表」")
     st.write("検出した統計表：", dataset_info)
     st.write("ExcelダウンロードURL：", excel_url)
     st.write("取得期間：", min_date, "～", max_date)
-    st.write("表示対象の都道府県：", "、".join(regions))
-    st.caption("e-Stat側のページやExcelの表構成が変更された場合、読み取り処理の調整が必要になることがあります。")
+    st.write("表示地域：", region_label)
+    st.write("抽出された都道府県数：", data["地域"].nunique())
+    st.caption("全国は取得した都道府県別データの合計値です。個別の全国公表値とは集計定義が異なる可能性があります。")
+    st.caption("構造別（木造・RC造など）の都道府県別データは、別の年次統計表を追加する必要があります。現時点では、この月次表で確認できる指標を表示しています。")
 
 st.subheader("AIによる傾向分析")
 try:
@@ -698,9 +729,9 @@ except Exception:
 
 if not groq_api_key:
     st.info("AI分析には、Streamlit Cloud の App settings → Secrets に GROQ_API_KEY を設定してください。")
-elif st.button("表示データをAI分析する"):
+elif st.button("表示中の地域・指標をAI分析する"):
     try:
-        with st.spinner("AIがデータを分析しています..."):
+        with st.spinner("AIが選択地域のデータを分析しています..."):
             st.write(analyze_with_groq(filtered, groq_api_key, groq_model))
     except Exception as exc:
         st.error(f"AI分析に失敗しました: {exc}")
