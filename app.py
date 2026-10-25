@@ -541,15 +541,16 @@ def build_national_series(data: pd.DataFrame) -> pd.DataFrame:
 def analyze_with_groq(data: pd.DataFrame, api_key: str, model: str) -> str:
     from groq import Groq
     client = Groq(api_key=api_key)
-    monthly = (
-        data.groupby("年月", as_index=False)["値"].sum()
-        .sort_values("年月")
+    pivot = (
+        data.pivot_table(index="年月", columns="指標", values="値", aggfunc="first")
+        .sort_index()
         .tail(36)
     )
-    summary = monthly.to_string(index=False)
+    summary = pivot.round(1).to_string()
     prompt = (
-        "以下は日本の住宅着工戸数データです。日本語で、長期傾向、直近の動き、"
-        "解釈上の注意を簡潔に分析してください。データにない原因は断定しないでください。\n\n"
+        "以下は選択した地域の住宅着工統計です。日本語で、指標ごとの長期傾向、直近の動き、"
+        "指標間の違い、解釈上の注意を簡潔に分析してください。データにない原因は断定しないでください。"
+        "分譲マンションと分譲一戸建ては分譲住宅の内数なので、住宅着工戸数や分譲住宅に加算しないでください。\n\n"
         + summary
     )
     result = client.chat.completions.create(
@@ -563,13 +564,161 @@ def analyze_with_groq(data: pd.DataFrame, api_key: str, model: str) -> str:
     return result.choices[0].message.content or "分析結果を取得できませんでした。"
 
 
+def make_pdf_chart_image(
+    metric_frame: pd.DataFrame,
+    display_measure: str,
+    chart_type: str,
+    start_date,
+    end_date,
+) -> io.BytesIO:
+    """Render a chart PNG for the PDF using Matplotlib; English axis labels avoid missing CJK fonts."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from matplotlib.ticker import FuncFormatter
+
+    value_col = "値" if display_measure == "着工戸数（戸）" else "前年比（％）"
+    plot_data = metric_frame[["年月", value_col]].copy()
+    plot_data["年月"] = pd.to_datetime(plot_data["年月"])
+    plot_data[value_col] = pd.to_numeric(plot_data[value_col], errors="coerce")
+    plot_data = plot_data.dropna(subset=["年月", value_col]).sort_values("年月")
+
+    fig, ax = plt.subplots(figsize=(7.2, 3.0), dpi=150)
+    if plot_data.empty:
+        ax.text(0.5, 0.5, "No data in selected period", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    else:
+        x = plot_data["年月"]
+        y = plot_data[value_col]
+        if chart_type == "棒":
+            ax.bar(x, y, width=22)
+        elif chart_type == "面":
+            ax.fill_between(x, y, alpha=0.25)
+            ax.plot(x, y, linewidth=1.4)
+        else:
+            ax.plot(x, y, linewidth=1.5)
+        if value_col == "前年比（％）":
+            ax.axhline(0, linewidth=0.9, linestyle="--")
+            ax.set_ylabel("Year-over-year (%)")
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda value, pos: f"{value:.0f}%"))
+        else:
+            ax.set_ylabel("Housing starts (units)")
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda value, pos: f"{value:,.0f}"))
+        span_months = max(0, (end_date.year - start_date.year) * 12 + end_date.month - start_date.month)
+        if span_months > 36:
+            ax.xaxis.set_major_locator(mdates.YearLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        elif span_months > 12:
+            ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        else:
+            ax.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, span_months // 6 or 1)))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        ax.set_xlabel("Month")
+        ax.grid(True, axis="both", alpha=0.25)
+        ax.tick_params(axis="x", labelrotation=25, labelsize=7)
+        ax.tick_params(axis="y", labelsize=7)
+    fig.tight_layout()
+    output = io.BytesIO()
+    fig.savefig(output, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    output.seek(0)
+    return output
+
+
+def create_dashboard_pdf(
+    chart_items: list[tuple[str, pd.DataFrame]],
+    region_label: str,
+    display_measure: str,
+    chart_type: str,
+    start_date,
+    end_date,
+    dataset_info: str,
+) -> bytes:
+    """Create a multi-page A4 landscape PDF with all visible indicator charts."""
+    from math import ceil
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfgen import canvas
+
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+    except Exception:
+        # The registration may already exist in the running process.
+        pass
+
+    output = io.BytesIO()
+    page_width, page_height = landscape(A4)
+    pdf = canvas.Canvas(output, pagesize=(page_width, page_height), pageCompression=1)
+    pdf.setTitle(f"住宅着工統計ダッシュボード - {region_label}")
+    pdf.setAuthor("住宅着工統計ダッシュボード")
+
+    margin = 26
+    col_gap = 18
+    col_width = (page_width - margin * 2 - col_gap) / 2
+    image_height = 160
+    charts_per_page = 4
+    page_count = max(1, ceil(len(chart_items) / charts_per_page))
+    note = "注：分譲マンション・分譲一戸建ては分譲住宅の内数です。総数・分譲住宅に加算しないでください。"
+
+    for page_index in range(page_count):
+        pdf.setFont("HeiseiKakuGo-W5", 15)
+        pdf.drawString(margin, page_height - 29, "住宅着工統計ダッシュボード")
+        pdf.setFont("HeiseiKakuGo-W5", 9)
+        pdf.drawString(
+            margin,
+            page_height - 47,
+            f"地域：{region_label}　期間：{start_date.strftime('%Y年%m月')}～{end_date.strftime('%Y年%m月')}　表示：{display_measure}　グラフ：{chart_type}",
+        )
+        pdf.setLineWidth(0.6)
+        pdf.line(margin, page_height - 55, page_width - margin, page_height - 55)
+
+        start_idx = page_index * charts_per_page
+        page_charts = chart_items[start_idx:start_idx + charts_per_page]
+        for local_index, (metric, frame) in enumerate(page_charts):
+            col = local_index % 2
+            row = local_index // 2
+            x = margin + col * (col_width + col_gap)
+            title_y = page_height - 74 - row * 218
+            image_y = title_y - image_height - 8
+
+            pdf.setFont("HeiseiKakuGo-W5", 10)
+            pdf.drawString(x, title_y, metric)
+            if metric in {"分譲マンション（内数）", "分譲一戸建て（内数）"}:
+                pdf.setFont("HeiseiKakuGo-W5", 7)
+                pdf.drawRightString(x + col_width, title_y, "※分譲住宅の内数")
+
+            image_buffer = make_pdf_chart_image(
+                frame, display_measure, chart_type, start_date, end_date
+            )
+            pdf.drawImage(
+                ImageReader(image_buffer), x, image_y,
+                width=col_width, height=image_height,
+                preserveAspectRatio=True, anchor="c", mask="auto",
+            )
+
+        pdf.setFont("HeiseiKakuGo-W5", 7)
+        pdf.drawString(margin, 35, note)
+        pdf.setFont("HeiseiKakuGo-W5", 6.5)
+        pdf.drawString(margin, 23, f"出典：e-Stat {dataset_info[:95]}")
+        pdf.drawRightString(page_width - margin, 23, f"{page_index + 1} / {page_count} ページ")
+        pdf.showPage()
+
+    pdf.save()
+    return output.getvalue()
+
+
 st.set_page_config(page_title="住宅着工統計ダッシュボード", page_icon="📊", layout="wide")
 st.title("住宅着工統計ダッシュボード")
-st.caption("e-Statの公開Excelを自動取得。地域を選ぶと、その地域のデータだけを全画面に反映します。")
+st.caption("選択した地域について、月次統計の各指標を複数のグラフで並べて比較し、PDFで保存できます。")
 
 with st.sidebar:
     st.header("① 地域を選択")
-    if st.button("e-Statからデータを再取得", use_container_width=True, help="キャッシュを削除し、次回の実行でExcelを取り直します。"):
+    if st.button("e-Statからデータを再取得", use_container_width=True, help="保存済みキャッシュを削除し、次回の実行でExcelを取り直します。"):
         st.cache_data.clear()
         st.rerun()
 
@@ -583,6 +732,7 @@ except Exception as exc:
     st.markdown(f"[e-Statの住宅着工統計一覧を開く]({ESTAT_HOUSING_LIST_URL})")
     st.stop()
 
+data = data.copy()
 data["年月"] = pd.to_datetime(data["年月"])
 min_month = data["年月"].min()
 max_month = data["年月"].max()
@@ -598,7 +748,7 @@ with st.sidebar:
         index=None,
         placeholder="地域を選択してください",
         key="region_selector",
-        help="全国を選ぶと、取得した47都道府県の値を合計します。都道府県を選ぶと、その都道府県だけを表示します。",
+        help="全国を選ぶと47都道府県の値を合計します。都道府県を選ぶと、その地域だけを表示します。",
     )
 
 if selected_region is None:
@@ -607,10 +757,12 @@ if selected_region is None:
 
 if selected_region == "全国":
     region_data = build_national_series(data)
+    region_label = "全国（47都道府県合計）"
 else:
     region_data = data.loc[data["地域"] == selected_region].copy()
+    region_label = selected_region
     if region_data.empty:
-        st.error(f"{selected_region}のデータを取得できていません。データ抽出状況を確認してください。")
+        st.error(f"{selected_region}のデータを取得できていません。")
         st.stop()
 
 metrics = [
@@ -624,90 +776,149 @@ if not available_metrics:
 
 with st.sidebar:
     st.divider()
-    st.header("② 指標・期間を選択")
-    selected_metric = st.selectbox("指標", available_metrics, index=0)
-    display_measure = st.radio("表示内容", ["着工戸数（戸）", "前年比（％）"], horizontal=False)
+    st.header("② 表示設定")
+    display_measure = st.radio(
+        "グラフの値",
+        ["着工戸数（戸）", "前年比（％）"],
+        index=0,
+        help="選択した表示内容を、以下の全グラフに一括で反映します。",
+    )
     start_date = st.date_input("開始月", value=min_date, min_value=min_date, max_value=max_date)
     end_date = st.date_input("終了月", value=max_date, min_value=min_date, max_value=max_date)
-    chart_type = st.selectbox("グラフ形式", ["折れ線", "棒", "面"])
-    show_table = st.checkbox("データ表を表示", value=True)
+    chart_type = st.selectbox("グラフ形式（全グラフ共通）", ["折れ線", "棒", "面"], index=0)
 
 if start_date > end_date:
     st.error("開始月は終了月以前の日付を指定してください。")
     st.stop()
 
-filtered = region_data[
-    (region_data["指標"] == selected_metric)
-    & (region_data["年月"].dt.date >= start_date)
+filtered_all = region_data[
+    (region_data["年月"].dt.date >= start_date)
     & (region_data["年月"].dt.date <= end_date)
-].copy().sort_values("年月")
-if filtered.empty:
-    st.warning("選択した地域・指標・期間に該当するデータがありません。")
+].copy().sort_values(["年月", "指標"])
+if filtered_all.empty:
+    st.warning("選択した地域・期間に該当するデータがありません。")
     st.stop()
-
-if selected_region == "全国":
-    region_label = "全国（47都道府県合計）"
-else:
-    region_label = selected_region
 
 value_col = "値" if display_measure == "着工戸数（戸）" else "前年比（％）"
-filtered = filtered[filtered[value_col].notna()].copy()
-if filtered.empty:
-    st.warning(f"選択した期間では「{display_measure}」を表示できるデータがありません。")
-    st.stop()
 
-latest_row = filtered.iloc[-1]
-latest_month = pd.Timestamp(latest_row["年月"])
-latest_value = float(latest_row[value_col])
-metric_label = "戸" if value_col == "値" else "%"
-prev_rows = filtered[filtered["年月"] < latest_month]
-month_delta = None
-if not prev_rows.empty:
-    month_delta = latest_value - float(prev_rows.iloc[-1][value_col])
+# KPI cards summarise counts, while chart panels below show all available indicators simultaneously.
+def latest_metric(metric: str, col: str = "値"):
+    part = filtered_all.loc[filtered_all["指標"] == metric].dropna(subset=[col]).sort_values("年月")
+    if part.empty:
+        return None, None
+    return part.iloc[-1][col], pd.Timestamp(part.iloc[-1]["年月"])
 
-c1, c2, c3 = st.columns(3)
-c1.metric("表示対象", region_label)
-c2.metric("最新月", latest_month.strftime("%Y年%m月"))
-c3.metric(f"最新値（{display_measure}）", f"{latest_value:,.1f} {metric_label}" if value_col != "値" else f"{latest_value:,.0f} {metric_label}")
+total_latest, latest_month = latest_metric("住宅着工戸数", "値")
+rental_latest, _ = latest_metric("貸家", "値")
+for_sale_latest, _ = latest_metric("分譲住宅", "値")
 
-st.subheader(f"{region_label}｜{selected_metric}の推移")
-plot_df = filtered.copy()
-plot_df["グラフ値"] = plot_df[value_col]
-if chart_type == "棒":
-    fig = px.bar(plot_df, x="年月", y="グラフ値", labels={"年月": "年月", "グラフ値": display_measure})
-elif chart_type == "面":
-    fig = px.area(plot_df, x="年月", y="グラフ値", labels={"年月": "年月", "グラフ値": display_measure})
-else:
-    fig = px.line(plot_df, x="年月", y="グラフ値", markers=False, labels={"年月": "年月", "グラフ値": display_measure})
-fig.update_layout(xaxis_title="年月", yaxis_title=display_measure)
-st.plotly_chart(fig, use_container_width=True)
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("表示地域", region_label)
+k2.metric("最新月", latest_month.strftime("%Y年%m月") if latest_month is not None else "データなし")
+k3.metric("住宅着工戸数", f"{total_latest:,.0f} 戸" if total_latest is not None else "データなし")
+k4.metric("貸家", f"{rental_latest:,.0f} 戸" if rental_latest is not None else "データなし")
 
-if value_col == "値":
-    yoy_value = latest_row.get("前年比（％）")
-    # For national totals the value is calculated from prefectural sums; its YoY is computed from that sum.
-    if pd.notna(yoy_value):
-        st.metric("前年同月比", f"{float(yoy_value):+.1f}%")
-    else:
-        st.caption("前年同月比は比較対象月がないため表示していません。")
-else:
-    st.caption("前年比は、原則としてe-Stat公表表の同月比を表示します。全国では47都道府県合計から算出しています。")
-
-if selected_metric in {"分譲マンション（内数）", "分譲一戸建て（内数）"}:
-    st.caption("※「内数」は分譲住宅の内訳です。分譲住宅の総数と加算しないでください。")
-
-if show_table:
-    st.subheader("データ一覧")
-    table = filtered[["年月", "地域", "指標", "値", "前年比（％）", "単位", "頻度", "出典"]].copy()
-    table["年月"] = table["年月"].dt.strftime("%Y-%m")
-    st.dataframe(table.sort_values("年月", ascending=False), use_container_width=True, hide_index=True)
-
-csv_bytes = filtered.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-st.download_button(
-    "表示データをCSVでダウンロード",
-    data=csv_bytes,
-    file_name=f"housing_starts_{selected_region}_{selected_metric}.csv",
-    mime="text/csv",
+st.subheader(f"{region_label}｜指標別の推移")
+st.caption(
+    f"{start_date.strftime('%Y年%m月')}～{end_date.strftime('%Y年%m月')}　・　"
+    f"{display_measure}　・　各指標を個別のグラフで表示しています。"
 )
+
+chart_items = []
+for metric in available_metrics:
+    metric_frame = filtered_all.loc[filtered_all["指標"] == metric].copy().sort_values("年月")
+    chart_items.append((metric, metric_frame))
+
+# Two-column dashboard layout: all monthly indicators appear in this single dashboard page.
+figures = []
+for idx in range(0, len(chart_items), 2):
+    columns = st.columns(2)
+    for col, item in zip(columns, chart_items[idx:idx + 2]):
+        metric, metric_frame = item
+        plot_data = metric_frame.dropna(subset=[value_col]).copy()
+        with col:
+            st.markdown(f"#### {metric}")
+            if metric in {"分譲マンション（内数）", "分譲一戸建て（内数）"}:
+                st.caption("分譲住宅の内数です。分譲住宅に加算しないでください。")
+            if plot_data.empty:
+                fig = px.line()
+                fig.add_annotation(
+                    text="選択期間に表示できるデータがありません。",
+                    x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+                )
+            else:
+                if chart_type == "棒":
+                    fig = px.bar(plot_data, x="年月", y=value_col)
+                elif chart_type == "面":
+                    fig = px.area(plot_data, x="年月", y=value_col)
+                else:
+                    fig = px.line(plot_data, x="年月", y=value_col, markers=False)
+            span_months = max(0, (end_date.year - start_date.year) * 12 + end_date.month - start_date.month)
+            if span_months > 36:
+                fig.update_xaxes(tickformat="%Y", dtick="M12")
+            elif span_months > 12:
+                fig.update_xaxes(tickformat="%Y-%m", dtick="M3")
+            else:
+                fig.update_xaxes(tickformat="%Y-%m")
+            if display_measure == "前年比（％）":
+                fig.add_hline(y=0, line_dash="dash")
+            fig.update_layout(
+                height=310,
+                margin=dict(l=10, r=10, t=15, b=10),
+                showlegend=False,
+                xaxis_title="年月",
+                yaxis_title=display_measure,
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            figures.append((metric, metric_frame))
+
+if "分譲マンション（内数）" in available_metrics or "分譲一戸建て（内数）" in available_metrics:
+    st.caption("※ 分譲マンション・分譲一戸建ては分譲住宅の内数です。総数や分譲住宅に加算しないでください。")
+
+# Export PDF for all chart panels, spread over as many landscape A4 pages as needed.
+pdf_signature = "|".join([
+    selected_region, display_measure, str(start_date), str(end_date), chart_type,
+    ",".join(available_metrics),
+])
+if st.session_state.get("dashboard_pdf_signature") != pdf_signature:
+    st.session_state.pop("dashboard_pdf_bytes", None)
+    st.session_state.pop("dashboard_pdf_signature", None)
+
+st.divider()
+st.subheader("グラフ全体をPDFに保存")
+st.write("上に表示されているすべての指標グラフを、横向きA4の複数ページPDFにまとめます。データ一覧表やCSVは出力しません。")
+if st.button("グラフ全体のPDFを作成", type="primary"):
+    try:
+        with st.spinner("全グラフをPDFにまとめています..."):
+            pdf_bytes = create_dashboard_pdf(
+                chart_items=chart_items,
+                region_label=region_label,
+                display_measure=display_measure,
+                chart_type=chart_type,
+                start_date=start_date,
+                end_date=end_date,
+                dataset_info=dataset_info,
+            )
+        st.session_state["dashboard_pdf_bytes"] = pdf_bytes
+        st.session_state["dashboard_pdf_signature"] = pdf_signature
+        st.success("PDFを作成しました。下のボタンから保存できます。")
+    except Exception as exc:
+        st.error("PDFの作成に失敗しました。")
+        st.code(str(exc))
+
+if (
+    st.session_state.get("dashboard_pdf_signature") == pdf_signature
+    and st.session_state.get("dashboard_pdf_bytes")
+):
+    safe_region = re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龠_-]+", "_", selected_region)
+    safe_measure = "戸数" if display_measure == "着工戸数（戸）" else "前年比"
+    st.download_button(
+        "PDFをダウンロード",
+        data=st.session_state["dashboard_pdf_bytes"],
+        file_name=f"住宅着工統計_{safe_region}_{safe_measure}_{start_date:%Y%m}_{end_date:%Y%m}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
 
 with st.expander("データ取得情報"):
     st.write("取得元：e-Stat「建築着工統計調査 / 住宅着工統計 / 時系列表」")
@@ -715,9 +926,9 @@ with st.expander("データ取得情報"):
     st.write("ExcelダウンロードURL：", excel_url)
     st.write("取得期間：", min_date, "～", max_date)
     st.write("表示地域：", region_label)
-    st.write("抽出された都道府県数：", data["地域"].nunique())
-    st.caption("全国は取得した都道府県別データの合計値です。個別の全国公表値とは集計定義が異なる可能性があります。")
-    st.caption("構造別（木造・RC造など）の都道府県別データは、別の年次統計表を追加する必要があります。現時点では、この月次表で確認できる指標を表示しています。")
+    st.write("グラフ数：", len(chart_items))
+    st.caption("全国は47都道府県のデータを合計しています。都道府県別・月次Excelで確認できる指標を表示しています。")
+    st.caption("木造・RC造などの構造別データは別の統計表が必要なため、現時点のグラフにはまだ含めていません。")
 
 st.subheader("AIによる傾向分析")
 try:
@@ -729,9 +940,9 @@ except Exception:
 
 if not groq_api_key:
     st.info("AI分析には、Streamlit Cloud の App settings → Secrets に GROQ_API_KEY を設定してください。")
-elif st.button("表示中の地域・指標をAI分析する"):
+elif st.button("選択した地域の全指標をAI分析する"):
     try:
-        with st.spinner("AIが選択地域のデータを分析しています..."):
-            st.write(analyze_with_groq(filtered, groq_api_key, groq_model))
+        with st.spinner("AIが選択地域の全指標を分析しています..."):
+            st.write(analyze_with_groq(filtered_all, groq_api_key, groq_model))
     except Exception as exc:
         st.error(f"AI分析に失敗しました: {exc}")
