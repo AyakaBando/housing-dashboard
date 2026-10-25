@@ -539,8 +539,10 @@ def build_national_series(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def analyze_with_groq(data: pd.DataFrame, api_key: str, model: str) -> str:
+    """Analyze the selected region and continue automatically if Groq truncates output."""
     from groq import Groq
-    client = Groq(api_key=api_key)
+
+    client = Groq(api_key=api_key, timeout=120.0, max_retries=2)
     pivot = (
         data.pivot_table(index="年月", columns="指標", values="値", aggfunc="first")
         .sort_index()
@@ -548,20 +550,45 @@ def analyze_with_groq(data: pd.DataFrame, api_key: str, model: str) -> str:
     )
     summary = pivot.round(1).to_string()
     prompt = (
-        "以下は選択した地域の住宅着工統計です。日本語で、指標ごとの長期傾向、直近の動き、"
-        "指標間の違い、解釈上の注意を簡潔に分析してください。データにない原因は断定しないでください。"
-        "分譲マンションと分譲一戸建ては分譲住宅の内数なので、住宅着工戸数や分譲住宅に加算しないでください。\n\n"
+        "以下は選択した地域の住宅着工統計です。次の見出しを使い、日本語で具体的に分析してください。\n"
+        "1. 全体傾向\n2. 指標ごとの変化\n3. 指標間の比較\n4. 解釈上の注意\n"
+        "数値が示すことと推測を区別し、データにない原因は断定しないでください。"
+        "住宅着工戸数・分譲住宅と、分譲マンション・分譲一戸建て（内数）を二重計上しないでください。"
+        "最後まで書き切り、結論で突然途切れないようにしてください。\n\n"
         + summary
     )
-    result = client.chat.completions.create(
-        model=model or "openai/gpt-oss-20b",
-        messages=[
-            {"role": "system", "content": "数値に忠実で、根拠のない推測を避ける分析担当者です。"},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    return result.choices[0].message.content or "分析結果を取得できませんでした。"
+    messages = [
+        {"role": "system", "content": "あなたは日本の住宅着工統計を分析するアナリストです。数値に忠実で、簡潔ながら結論まで完結した回答を書きます。"},
+        {"role": "user", "content": prompt},
+    ]
+    parts = []
+    # The model API's default completion budget can be too low when reasoning tokens
+    # are also counted. Request a larger budget and continue if the server reports length.
+    for continuation_index in range(3):
+        response = client.chat.completions.create(
+            model=model or "openai/gpt-oss-20b",
+            messages=messages,
+            temperature=0.2,
+            max_completion_tokens=4096,
+            reasoning_effort="low",
+        )
+        choice = response.choices[0]
+        content = (choice.message.content or "").strip()
+        if content:
+            parts.append(content)
+        if choice.finish_reason != "length":
+            break
+        messages.append({"role": "assistant", "content": content})
+        messages.append({
+            "role": "user",
+            "content": "前の回答が出力上限で途中終了しました。すでに書いた文章を繰り返さず、途切れた箇所の続きから回答全体を完結させてください。最後に結論を含めてください。",
+        })
+    final_text = "\n\n".join(parts).strip()
+    if not final_text:
+        raise RuntimeError("AIから分析文が返されませんでした。Groqのモデル名とAPIキーを確認してください。")
+    if response.choices[0].finish_reason == "length":
+        final_text += "\n\n※AIの出力上限に達したため、分析の末尾が短くなっている可能性があります。もう一度実行すると続きが改善する場合があります。"
+    return final_text
 
 
 def make_pdf_chart_image(
@@ -577,13 +604,17 @@ def make_pdf_chart_image(
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     from matplotlib.ticker import FuncFormatter
-    from matplotlib import font_manager
-    # Linux/Streamlit Cloudにある日本語フォントを優先して使用
-    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
-    for font_name in ["Noto Sans CJK JP", "Noto Serif CJK JP", "IPAexGothic"]:
-        if font_name in available_fonts:
-            plt.rcParams["font.family"] = font_name
-            break
+    # requirements.txt includes a package that provides the Japanese IPAex Gothic font.
+    # Import after pyplot and explicitly set the family so PDF graph images do not use
+    # the default Latin-only font on Streamlit Community Cloud.
+    try:
+        import japanize_matplotlib_modern  # noqa: F401
+        plt.rcParams["font.family"] = "IPAexGothic"
+    except Exception as exc:
+        raise RuntimeError(
+            "PDFグラフ用の日本語フォントを読み込めませんでした。"
+            "requirements.txt の japanize-matplotlib-modern のインストール後に再デプロイしてください。"
+        ) from exc
     plt.rcParams["axes.unicode_minus"] = False
 
     value_col = "値" if display_measure == "着工戸数（戸）" else "前年比（％）"
@@ -722,7 +753,7 @@ def create_dashboard_pdf(
 
 st.set_page_config(page_title="住宅着工統計ダッシュボード", page_icon="📊", layout="wide")
 st.title("住宅着工統計ダッシュボード")
-st.caption("選択した地域について、月次統計の各指標を複数のグラフで並べて比較し、PDFで保存できます。")
+st.caption("地域と対象期間を選ぶと、月次統計の各指標を複数のグラフで比較し、PDFで保存できます。")
 
 with st.sidebar:
     st.header("① 地域を選択")
@@ -782,20 +813,75 @@ if not available_metrics:
     st.error("選択した地域で表示できる指標がありません。")
     st.stop()
 
+# Build explicit Japanese year/month menus from the months actually present in the workbook.
+# This makes 2025 a visible year option and avoids browser-specific date-input formatting.
+available_months = sorted(
+    pd.Timestamp(value).to_period("M").to_timestamp()
+    for value in region_data["年月"].dropna().drop_duplicates().tolist()
+)
+period_years = sorted({month.year for month in available_months})
+months_by_year = {
+    year: sorted({month.month for month in available_months if month.year == year})
+    for year in period_years
+}
+default_start_year = 2020 if 2020 in period_years else period_years[0]
+default_end_year = period_years[-1]
+
 with st.sidebar:
     st.divider()
     st.header("② 表示設定")
     display_measure = st.radio(
-        "グラフの値",
+        "表示する数値",
         ["着工戸数（戸）", "前年比（％）"],
         index=0,
-        help="選択した表示内容を、以下の全グラフに一括で反映します。",
+        help="選択した表示内容を、以下の全グラフとPDFに反映します。",
     )
-    start_date = st.date_input("開始月", value=min_date, min_value=min_date, max_value=max_date)
-    end_date = st.date_input("終了月", value=max_date, min_value=min_date, max_value=max_date)
+    st.markdown("**開始年月**")
+    start_year_col, start_month_col = st.columns(2)
+    with start_year_col:
+        start_year = st.selectbox(
+            "開始年", options=period_years,
+            index=period_years.index(default_start_year),
+            format_func=lambda year: f"{year}年",
+            key="period_start_year",
+        )
+    with start_month_col:
+        start_month_options = months_by_year[start_year]
+        preferred_start_month = 1 if 1 in start_month_options else start_month_options[0]
+        start_month = st.selectbox(
+            "開始月", options=start_month_options,
+            index=start_month_options.index(preferred_start_month),
+            format_func=lambda month: f"{month}月",
+            key=f"period_start_month_{start_year}",
+        )
 
+    st.markdown("**終了年月**")
+    end_year_col, end_month_col = st.columns(2)
+    with end_year_col:
+        end_year = st.selectbox(
+            "終了年", options=period_years,
+            index=period_years.index(default_end_year),
+            format_func=lambda year: f"{year}年",
+            key="period_end_year",
+        )
+    with end_month_col:
+        end_month_options = months_by_year[end_year]
+        preferred_end_month = 12 if 12 in end_month_options else end_month_options[-1]
+        end_month = st.selectbox(
+            "終了月", options=end_month_options,
+            index=end_month_options.index(preferred_end_month),
+            format_func=lambda month: f"{month}月",
+            key=f"period_end_month_{end_year}",
+        )
+    st.caption(
+        f"取得済み期間：{min_month:%Y年%m月}～{max_month:%Y年%m月} "
+        f"（{period_years[0]}～{period_years[-1]}年）"
+    )
+
+start_date = date(int(start_year), int(start_month), 1)
+end_date = date(int(end_year), int(end_month), 1)
 if start_date > end_date:
-    st.error("開始月は終了月以前の日付を指定してください。")
+    st.error("開始年月は終了年月以前を指定してください。")
     st.stop()
 
 filtered_all = region_data[
@@ -861,11 +947,11 @@ for idx in range(0, len(chart_items), 2):
                     fig = px.line(plot_data, x="年月", y=value_col, markers=False)
             span_months = max(0, (end_date.year - start_date.year) * 12 + end_date.month - start_date.month)
             if span_months > 36:
-                fig.update_xaxes(tickformat="%Y", dtick="M12")
+                fig.update_xaxes(tickformat="%Y年", dtick="M12")
             elif span_months > 12:
-                fig.update_xaxes(tickformat="%Y-%m", dtick="M3")
+                fig.update_xaxes(tickformat="%Y年%m月", dtick="M3")
             else:
-                fig.update_xaxes(tickformat="%Y-%m")
+                fig.update_xaxes(tickformat="%Y年%m月", dtick="M1")
             if display_measure == "前年比（％）":
                 fig.add_hline(y=0, line_dash="dash")
             fig.update_layout(
@@ -943,11 +1029,24 @@ except Exception:
     groq_api_key = ""
     groq_model = "openai/gpt-oss-20b"
 
+analysis_signature = f"{selected_region}|{start_date}|{end_date}"
+if st.session_state.get("ai_analysis_signature") != analysis_signature:
+    st.session_state.pop("ai_analysis_result", None)
+    st.session_state.pop("ai_analysis_signature", None)
+
 if not groq_api_key:
-    st.info("AI分析には、Streamlit Cloud の App settings → Secrets に GROQ_API_KEY を設定してください。")
-elif st.button("選択した地域の全指標をAI分析する"):
-    try:
-        with st.spinner("AIが選択地域の全指標を分析しています..."):
-            st.write(analyze_with_groq(filtered_all, groq_api_key, groq_model))
-    except Exception as exc:
-        st.error(f"AI分析に失敗しました: {exc}")
+    st.info("AI分析を利用するには、Streamlit Cloud の App settings → Secrets に GROQ_API_KEY を設定してください。")
+else:
+    if st.button("選択した地域の全指標をAI分析する"):
+        try:
+            with st.spinner("AIが分析しています。文章が途中で切れた場合は自動で続きを取得します..."):
+                analysis_text = analyze_with_groq(filtered_all, groq_api_key, groq_model)
+            st.session_state["ai_analysis_result"] = analysis_text
+            st.session_state["ai_analysis_signature"] = analysis_signature
+        except Exception as exc:
+            st.error(f"AI分析に失敗しました: {exc}")
+    if (
+        st.session_state.get("ai_analysis_signature") == analysis_signature
+        and st.session_state.get("ai_analysis_result")
+    ):
+        st.markdown(st.session_state["ai_analysis_result"])
