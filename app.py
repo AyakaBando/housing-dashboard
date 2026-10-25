@@ -10,7 +10,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-APP_VERSION = "A4-PDF v5"
+APP_VERSION = "A4-PDF v6・数値ラベル"
 
 # The e-Stat monthly timeseries list. "layout=dataset" is used by the current listing.
 ESTAT_HOUSING_LIST_URL = (
@@ -1266,9 +1266,10 @@ def render_regional_metric_section(section_title, raw_df, source_url, selected_r
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     latest = chart_df[chart_df["年月"] == chart_df["年月"].max()].sort_values("値", ascending=False)
     if not latest.empty:
-        latest_fig = px.bar(latest, x="値", y="指標", orientation="h", color="指標",
+        latest_fig = px.bar(latest, x="値", y="指標", orientation="h", color="指標", text="値",
                             labels={"値": f"値（{unit_label}）", "指標": "項目"})
-        latest_fig.update_layout(height=max(240, min(520, 42 * len(latest))), margin=dict(l=4, r=8, t=6, b=5), showlegend=False)
+        latest_fig.update_traces(texttemplate="%{x:,.1f}", textposition="outside", cliponaxis=False, textfont=dict(size=10))
+        latest_fig.update_layout(height=max(240, min(520, 42 * len(latest))), margin=dict(l=4, r=36, t=6, b=5), showlegend=False)
         latest_fig.update_yaxes(autorange="reversed")
         st.plotly_chart(latest_fig, use_container_width=True, config={"displayModeBar": False})
     pdf_specs = [{"title": section_title, "data": chart_df, "kind": "line", "unit": unit_label}]
@@ -1388,14 +1389,46 @@ def setup_matplotlib_japanese():
     return plt
 
 
+def _format_data_label(value, percent=False):
+    """Format chart data labels compactly without scientific notation."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not pd.notna(v):
+        return ""
+    if percent:
+        return f"{v:,.1f}%"
+    if abs(v) >= 1000:
+        return f"{v:,.0f}"
+    if abs(v) >= 100:
+        return f"{v:,.0f}"
+    if abs(v) >= 10:
+        return f"{v:,.1f}".rstrip("0").rstrip(".")
+    if abs(v) >= 1:
+        return f"{v:,.1f}".rstrip("0").rstrip(".")
+    return f"{v:,.2f}".rstrip("0").rstrip(".")
+
+
+def _sample_label_indices(n, max_labels):
+    """Pick evenly spaced points, always including the last point."""
+    if n <= 0:
+        return []
+    count = min(n, max(1, int(max_labels)))
+    if count == 1:
+        return [n - 1]
+    values = [round(i * (n - 1) / (count - 1)) for i in range(count)]
+    return list(dict.fromkeys(values))
+
+
 def make_pdf_chart_image(kind, trend_df, compare_df, composition_df, figsize=None):
-    """Render one of the overview charts as a Japanese-labelled PNG."""
+    """Render overview charts with numeric data labels for PDF reading."""
     import io
     import matplotlib.dates as mdates
     from matplotlib.ticker import FuncFormatter
 
     plt = setup_matplotlib_japanese()
-    fig, ax = plt.subplots(figsize=figsize or (5.1, 4.0), dpi=160)
+    fig, ax = plt.subplots(figsize=figsize or (5.1, 4.0), dpi=180)
 
     if kind == "trend":
         if trend_df.empty:
@@ -1403,9 +1436,30 @@ def make_pdf_chart_image(kind, trend_df, compare_df, composition_df, figsize=Non
             ax.set_axis_off()
         else:
             x = pd.to_datetime(trend_df["年月"])
-            ax.plot(x, trend_df["値"], label="月別実績", color="#3478f6", linewidth=1.5)
-            ax.plot(x, trend_df["年度累計"], label="年度累計", color="#32a879", linewidth=1.5)
-            ax.plot(x, trend_df["移動年計"], label="移動年計（12か月）", color="#ef5350", linewidth=1.5)
+            series_specs = [
+                ("値", "月別実績", "#3478f6", 8),
+                ("年度累計", "年度累計", "#32a879", -11),
+                ("移動年計", "移動年計（12か月）", "#ef5350", 15),
+            ]
+            n = len(trend_df)
+            label_idx = _sample_label_indices(n, min(8, n))
+            for col, label, color, offset in series_specs:
+                if col not in trend_df:
+                    continue
+                y = pd.to_numeric(trend_df[col], errors="coerce")
+                ax.plot(x, y, label=label, color=color, linewidth=1.8, marker="o", markersize=2.2)
+                # Label a handful of evenly spaced reference values plus the latest month.
+                for idx in label_idx:
+                    if idx >= len(y) or pd.isna(y.iloc[idx]):
+                        continue
+                    value = float(y.iloc[idx])
+                    ax.annotate(
+                        _format_data_label(value), (x.iloc[idx], value),
+                        xytext=(0, offset), textcoords="offset points", ha="center", va="center",
+                        fontsize=6.5, color=color,
+                        bbox={"boxstyle": "round,pad=0.12", "facecolor": "white", "edgecolor": "none", "alpha": 0.80},
+                        clip_on=True,
+                    )
             ax.set_ylabel("着工戸数（戸）")
             ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:,.0f}"))
             ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
@@ -1421,33 +1475,45 @@ def make_pdf_chart_image(kind, trend_df, compare_df, composition_df, figsize=Non
             months = list(compare_df["月ラベル"])
             pos = list(range(len(months)))
             width = 0.37
-            ax.bar([p - width / 2 for p in pos], compare_df["前年値"], width=width, label=compare_df.attrs.get("前年ラベル", "前年"), color="#a6b1bd")
-            ax.bar([p + width / 2 for p in pos], compare_df["最新年値"], width=width, label=compare_df.attrs.get("最新年ラベル", "最新年"), color="#3478f6")
+            prev_values = pd.to_numeric(compare_df["前年値"], errors="coerce").fillna(0).tolist()
+            latest_values = pd.to_numeric(compare_df["最新年値"], errors="coerce").fillna(0).tolist()
+            prev_bars = ax.bar([p - width / 2 for p in pos], prev_values, width=width,
+                               label=compare_df.attrs.get("前年ラベル", "前年"), color="#a6b1bd")
+            latest_bars = ax.bar([p + width / 2 for p in pos], latest_values, width=width,
+                                 label=compare_df.attrs.get("最新年ラベル", "最新年"), color="#3478f6")
+            # Numeric labels on every bar; rotate slightly to avoid collisions between years.
+            ax.bar_label(prev_bars, labels=[_format_data_label(v) if v else "0" for v in prev_values],
+                         padding=1, fontsize=6.2, rotation=45)
+            ax.bar_label(latest_bars, labels=[_format_data_label(v) if v else "0" for v in latest_values],
+                         padding=1, fontsize=6.2, rotation=45)
             ax.set_xticks(pos, months)
             ax.set_ylabel("着工戸数（戸）")
             ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:,.0f}"))
             ax.legend(loc="upper left", fontsize=8, frameon=False)
             ax.grid(True, axis="y", alpha=0.22)
+            ax.margins(y=0.22)
     elif kind == "composition":
         if composition_df.empty or composition_df["値"].sum() <= 0:
             ax.text(0.5, 0.5, "構成比を表示できるデータがありません", ha="center", va="center", transform=ax.transAxes)
             ax.set_axis_off()
         else:
+            values = pd.to_numeric(composition_df["値"], errors="coerce").fillna(0).tolist()
+            names = composition_df["表示名"].astype(str).tolist()
+            labels = [f"{name}\n{value:,.0f}戸" for name, value in zip(names, values)]
             ax.pie(
-                composition_df["値"], labels=composition_df["表示名"], autopct="%1.1f%%",
-                startangle=90, counterclock=False, pctdistance=0.77,
+                values, labels=labels, autopct="%1.1f%%",
+                startangle=90, counterclock=False, pctdistance=0.72, labeldistance=1.12,
                 wedgeprops={"width": 0.42, "edgecolor": "white"},
-                textprops={"fontsize": 8},
+                textprops={"fontsize": 7.8},
             )
             ax.set_aspect("equal")
 
-    fig.tight_layout(pad=1.2)
+    fig.tight_layout(pad=1.35)
     output = io.BytesIO()
-    fig.savefig(output, format="png", dpi=150, bbox_inches="tight", facecolor="white")
+    fig.savefig(output, format="png", dpi=180, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     output.seek(0)
     return output
-
 
 def create_dashboard_pdf(region_label, start_date, end_date, latest_month, cards, trend_df, compare_df, composition_df):
     """Export the overview to two consistently sized A4 landscape pages for readability."""
@@ -1492,7 +1558,7 @@ def create_dashboard_pdf(region_label, start_date, end_date, latest_month, cards
         pdf.setFillColor(grey)
         pdf.setFont(font, 7)
         pdf.drawString(margin, 16, "出典：e-Stat 建築着工統計調査")
-        pdf.drawRightString(page_width - margin, 16, f"{page_no} / 2　A4 v5")
+        pdf.drawRightString(page_width - margin, 16, f"{page_no} / 2　{APP_VERSION}")
 
     # Page 1: KPI cards in a 3x2 grid, then a large full-width trend chart.
     draw_header("市場概況・住宅着工戸数の推移", 1)
@@ -1709,7 +1775,7 @@ def _render_generic_pdf_chart(spec):
         labels = [_compact_category_label(label, max_chars=22) for label in full_labels]
         values = pd.to_numeric(df["_表示値"], errors="coerce").fillna(0).tolist()
         y_positions = list(range(len(labels)))
-        ax.barh(y_positions, values, color="#3478f6", height=0.68)
+        bars = ax.barh(y_positions, values, color="#3478f6", height=0.68)
         ax.set_yticks(y_positions)
         ax.set_yticklabels(labels)
         ax.set_xlabel(f"値（{display_unit}）", fontsize=10)
@@ -1718,13 +1784,52 @@ def _render_generic_pdf_chart(spec):
         ax.tick_params(axis="y", labelsize=8.5, pad=7)
         ax.tick_params(axis="x", labelsize=8.5)
         ax.grid(True, axis="x", alpha=0.22)
+        # Put the numeric value at the end of every bar. Extend x range to leave room for labels.
+        label_font = 7.5 if len(values) <= 12 else 6.5
+        ax.bar_label(bars, labels=[_format_data_label(v) for v in values], padding=3, fontsize=label_font)
+        max_value = max([abs(v) for v in values] + [1])
+        ax.set_xlim(min(0, min(values, default=0) * 1.05), max_value * 1.18)
         # More left margin for Japanese multi-level labels; the labels themselves are abbreviated/wrapped.
-        fig.subplots_adjust(left=0.29, right=0.98, top=0.90, bottom=0.12)
+        fig.subplots_adjust(left=0.29, right=0.96, top=0.90, bottom=0.12)
     else:
-        for label, group in df.groupby("指標", sort=False):
+        grouped_series = list(df.groupby("指標", sort=False))
+        series_count = len(grouped_series)
+        # Avoid filling a long timeline with unreadable labels: label all annual/short series,
+        # sample long series, and show latest endpoints for charts with many categories.
+        for series_index, (label, group) in enumerate(grouped_series):
             group = group.sort_values("年月")
-            ax.plot(pd.to_datetime(group["年月"]), pd.to_numeric(group["_表示値"], errors="coerce"),
-                    label=_compact_category_label(label, max_chars=24), linewidth=1.8)
+            dates = pd.to_datetime(group["年月"])
+            values = pd.to_numeric(group["_表示値"], errors="coerce")
+            ax.plot(dates, values, label=_compact_category_label(label, max_chars=24),
+                    linewidth=1.8, marker="o" if len(group) <= 24 else None,
+                    markersize=3.2 if len(group) <= 24 else 2)
+            n_points = len(group)
+            if series_count == 1:
+                max_labels = n_points if n_points <= 16 else 12
+            elif series_count <= 3:
+                max_labels = n_points if n_points <= 12 else 7
+            elif series_count <= 6:
+                max_labels = min(4, n_points)
+            else:
+                max_labels = 1
+            indexes = _sample_label_indices(n_points, max_labels)
+            for label_index, point_index in enumerate(indexes):
+                if point_index >= n_points or pd.isna(values.iloc[point_index]):
+                    continue
+                value = float(values.iloc[point_index])
+                # Stagger labels so neighboring series and points are less likely to collide.
+                if max_labels == 1:
+                    offset = (4, 4 + (series_index % 3) * 4)
+                else:
+                    offset = (0, 7 if (label_index + series_index) % 2 == 0 else -10)
+                ax.annotate(
+                    _format_data_label(value, percent=("%" in str(spec.get("unit", "")))),
+                    (dates.iloc[point_index], value), xytext=offset, textcoords="offset points",
+                    ha="center" if max_labels > 1 else "left", va="center", fontsize=6.3,
+                    color="#273746",
+                    bbox={"boxstyle": "round,pad=0.10", "facecolor": "white", "edgecolor": "none", "alpha": 0.78},
+                    clip_on=True,
+                )
         ax.set_ylabel(display_unit, fontsize=10)
         ax.ticklabel_format(axis="y", style="plain", useOffset=False)
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=8))
@@ -1732,7 +1837,7 @@ def _render_generic_pdf_chart(spec):
         ax.tick_params(axis="x", labelrotation=20, labelsize=8.5)
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:,.0f}" if abs(v) >= 10 else f"{v:,.1f}".rstrip("0").rstrip(".")))
         ax.tick_params(axis="y", labelsize=8.5)
-        if df["指標"].nunique() > 1:
+        if series_count > 1:
             ax.legend(loc="best", fontsize=8, frameon=False)
         ax.grid(True, alpha=0.22)
         fig.subplots_adjust(left=0.10, right=0.98, top=0.90, bottom=0.16)
@@ -1793,7 +1898,7 @@ def create_multi_chart_pdf(title, region_label, period_label, specs):
         pdf.setFont(font, 7)
         pdf.setFillColor(colors.HexColor("#64748b"))
         pdf.drawString(margin, 16, "出典：e-Stat 公開統計表")
-        pdf.drawRightString(width - margin, 16, f"{page_no} / {total_pages}　A4 v5")
+        pdf.drawRightString(width - margin, 16, f"{page_no} / {total_pages}　{APP_VERSION}")
         pdf.showPage()
 
     pdf.save()
@@ -2340,9 +2445,17 @@ if analysis_view == "市場概況":
         st.markdown('<div class="panel-title">住宅着工戸数の推移</div>', unsafe_allow_html=True)
         trend_fig = go.Figure()
         if not trend_df.empty:
-            trend_fig.add_trace(go.Scatter(x=trend_df["年月"], y=trend_df["値"], name="月別実績", mode="lines", line=dict(color="#3478f6", width=2)))
-            trend_fig.add_trace(go.Scatter(x=trend_df["年月"], y=trend_df["年度累計"], name="年度累計", mode="lines", line=dict(color="#29a66f", width=2)))
-            trend_fig.add_trace(go.Scatter(x=trend_df["年月"], y=trend_df["移動年計"], name="移動年計", mode="lines", line=dict(color="#ef5058", width=2)))
+            def latest_value_text(series):
+                values = pd.to_numeric(series, errors="coerce").reset_index(drop=True)
+                labels = [""] * len(values)
+                valid_positions = [i for i, value in enumerate(values.tolist()) if pd.notna(value)]
+                if valid_positions:
+                    last_position = valid_positions[-1]
+                    labels[last_position] = f"{values.iloc[last_position]:,.0f}"
+                return labels
+            trend_fig.add_trace(go.Scatter(x=trend_df["年月"], y=trend_df["値"], name="月別実績", mode="lines+markers+text", text=latest_value_text(trend_df["値"]), textposition="top center", textfont=dict(size=10, color="#3478f6"), marker=dict(size=3), line=dict(color="#3478f6", width=2)))
+            trend_fig.add_trace(go.Scatter(x=trend_df["年月"], y=trend_df["年度累計"], name="年度累計", mode="lines+markers+text", text=latest_value_text(trend_df["年度累計"]), textposition="bottom center", textfont=dict(size=10, color="#29a66f"), marker=dict(size=3), line=dict(color="#29a66f", width=2)))
+            trend_fig.add_trace(go.Scatter(x=trend_df["年月"], y=trend_df["移動年計"], name="移動年計", mode="lines+markers+text", text=latest_value_text(trend_df["移動年計"]), textposition="top center", textfont=dict(size=10, color="#ef5058"), marker=dict(size=3), line=dict(color="#ef5058", width=2)))
         trend_fig.update_layout(height=390, margin=dict(l=0,r=4,t=12,b=5), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)), xaxis_title=None, yaxis_title="戸数（戸）", hovermode="x unified")
         trend_fig.update_xaxes(tickformat="%Y年%m月", nticks=7, showgrid=True, gridcolor="#e8edf3")
         trend_fig.update_yaxes(tickformat=",.0f", showgrid=True, gridcolor="#e8edf3")
@@ -2351,8 +2464,8 @@ if analysis_view == "市場概況":
     with chart_cols[1]:
         st.markdown(f'<div class="panel-title">月別比較（{previous_fiscal_year}年度・{latest_fiscal_year}年度）</div>', unsafe_allow_html=True)
         compare_fig = go.Figure()
-        compare_fig.add_trace(go.Bar(x=compare_df["月ラベル"], y=compare_df["前年値"], name=f"{previous_fiscal_year}年度", marker_color="#aeb8c3"))
-        compare_fig.add_trace(go.Bar(x=compare_df["月ラベル"], y=compare_df["最新年値"], name=f"{latest_fiscal_year}年度", marker_color="#3478f6"))
+        compare_fig.add_trace(go.Bar(x=compare_df["月ラベル"], y=compare_df["前年値"], name=f"{previous_fiscal_year}年度", marker_color="#aeb8c3", text=[_format_data_label(v) if pd.notna(v) else "" for v in compare_df["前年値"]], textposition="outside", textfont=dict(size=8), cliponaxis=False))
+        compare_fig.add_trace(go.Bar(x=compare_df["月ラベル"], y=compare_df["最新年値"], name=f"{latest_fiscal_year}年度", marker_color="#3478f6", text=[_format_data_label(v) if pd.notna(v) else "" for v in compare_df["最新年値"]], textposition="outside", textfont=dict(size=8), cliponaxis=False))
         compare_fig.update_layout(barmode="group", height=390, margin=dict(l=0,r=4,t=12,b=5), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)), xaxis_title=None, yaxis_title="戸数（戸）")
         compare_fig.update_yaxes(tickformat=",.0f", showgrid=True, gridcolor="#e8edf3")
         compare_fig.update_xaxes(showgrid=False)
@@ -2362,7 +2475,7 @@ if analysis_view == "市場概況":
         st.markdown(f'<div class="panel-title">利用関係別構成比（{latest_month:%Y年%m月}）</div>', unsafe_allow_html=True)
         if not composition_df.empty and composition_df["値"].sum() > 0:
             composition_fig = px.pie(composition_df, values="値", names="表示名", hole=0.48, color="表示名", color_discrete_map={"持家":"#35a879", "貸家":"#f59a43", "給与住宅":"#9b59d0", "分譲：マンション":"#e95059", "分譲：戸建て":"#22a6c7"})
-            composition_fig.update_traces(textposition="inside", textinfo="label+percent", insidetextfont=dict(color="white", size=11), hovertemplate="%{label}<br>%{value:,.0f}戸 (%{percent})<extra></extra>")
+            composition_fig.update_traces(textposition="inside", texttemplate="%{label}<br>%{value:,.0f}戸<br>%{percent}", insidetextfont=dict(color="white", size=10), hovertemplate="%{label}<br>%{value:,.0f}戸 (%{percent})<extra></extra>")
             composition_fig.update_layout(height=390, margin=dict(l=0,r=0,t=12,b=5), showlegend=False)
             st.plotly_chart(composition_fig, use_container_width=True, config={"displayModeBar": False})
         else:
@@ -2614,6 +2727,8 @@ elif analysis_view == "建築規模・非住宅":
                     labels={"表示値": f"値（{display_unit}）", "表示項目": "用途・構造"},
                 )
                 bfig.update_traces(
+                    text=b_visible["表示値"].map(_format_data_label), texttemplate="%{text}", textposition="outside", cliponaxis=False,
+                    textfont=dict(size=10),
                     hovertemplate="%{customdata[0]}<br>値：%{customdata[1]:,.0f} " + b_unit_label + "<extra></extra>"
                 )
                 bfig.update_xaxes(tickformat=",.0f", exponentformat="none", showexponent="none", separatethousands=True)
