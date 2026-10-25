@@ -700,6 +700,158 @@ def _unit_for_metric(label, default_unit, workbook_unit):
     return workbook_unit or "値"
 
 
+def _parse_legacy_structure_table(df, period, sheet_name, dataset_name, default_unit="戸"):
+    """Parse e-Stat's historical annual housing table where prefecture names are vertically split.
+
+    Historical sheets (e.g. 昭和63年, 平成元年) use a multi-row header:
+    structure -> building form -> measure (units / total floor area). The region name
+    column can be split one character at a time down the five utilization rows
+    (計, 持家, 貸家, 給与住宅, 分譲住宅), so ordinary exact-cell prefecture matching fails.
+    """
+    if df.shape[1] < 8 or len(df) < 8:
+        return None, "表の行数または列数が想定より少ない"
+
+    normalized_rows = []
+    for row_idx in range(min(20, len(df))):
+        vals = [clean_text(v) for v in df.iloc[row_idx].tolist()]
+        normalized_rows.append((row_idx, vals, "".join(vals)))
+
+    # Anchor on the label in column B as well as the other header contents. The sheet title
+    # itself contains words such as 利用関係別・戸数・床面積の合計 and must not be mistaken
+    # for the actual measure-header row.
+    structure_row = next((idx for idx, vals, joined in normalized_rows
+                          if len(vals) > 1 and vals[1] == "構造別"
+                          and "木造" in joined and "総計" in joined), None)
+    building_row = next((idx for idx, vals, joined in normalized_rows
+                         if len(vals) > 1 and vals[1] == "建て方別"
+                         and "一戸建" in joined and "共同住宅" in joined), None)
+    measure_row = next((idx for idx, vals, joined in normalized_rows
+                        if len(vals) > 1 and vals[1] == "利用関係別"
+                        and "戸数" in joined and "床面積の合計" in joined), None)
+    if structure_row is None or building_row is None or measure_row is None:
+        return None, "構造別・建て方別・利用関係別の複数段ヘッダーを特定できない"
+
+    header_end = max(structure_row, building_row, measure_row)
+    if not (structure_row < building_row < measure_row):
+        # Some e-Stat revisions change vertical positions; still require distinct rows.
+        if len({structure_row, building_row, measure_row}) < 3:
+            return None, "統計表の見出し行を区別できない"
+
+    # These headers represent merged Excel cells. Fill horizontally within each header row.
+    def expanded_header_row(row_idx):
+        output = [""] * df.shape[1]
+        current = ""
+        for col_idx in range(2, df.shape[1]):
+            raw = clean_text(df.iat[row_idx, col_idx])
+            if raw:
+                current = raw
+            output[col_idx] = current
+        return output
+
+    structure_headers = expanded_header_row(structure_row)
+    building_headers = expanded_header_row(building_row)
+    measure_headers = expanded_header_row(measure_row)
+
+    header_labels = {}
+    for col_idx in range(2, df.shape[1]):
+        structure = structure_headers[col_idx]
+        building = building_headers[col_idx]
+        measure = measure_headers[col_idx]
+        # Skip columns with incomplete or non-data header combinations.
+        if not structure or not measure:
+            continue
+        parts = []
+        for part in (structure, building):
+            if part and part not in parts:
+                parts.append(part)
+        if measure:
+            parts.append(measure)
+        header_labels[col_idx] = "／".join(parts)
+
+    categories = {"計", "持家", "貸家", "給与住宅", "分譲住宅"}
+    def category_at(row_idx):
+        return clean_text(df.iat[row_idx, 1]) if df.shape[1] > 1 else ""
+
+    # Table begins on rows where the relation column says 計 and there are numeric cells.
+    starts = []
+    for row_idx in range(header_end + 1, len(df)):
+        if category_at(row_idx) != "計":
+            continue
+        numeric_count = sum(numeric_value(df.iat[row_idx, col_idx]) is not None
+                            for col_idx in range(2, df.shape[1]))
+        if numeric_count >= 5:
+            starts.append(row_idx)
+
+    if not starts:
+        return None, "利用関係別のデータ開始行を特定できない"
+
+    records = []
+    unresolved = []
+    for group_idx, start_row in enumerate(starts):
+        stop_row = starts[group_idx + 1] if group_idx + 1 < len(starts) else len(df)
+        group_rows = [r for r in range(start_row, stop_row) if category_at(r) in categories]
+        if not group_rows:
+            continue
+
+        # In these historical tables the prefecture label may be split vertically across rows.
+        fragments = []
+        for row_idx in group_rows:
+            part = normalize_pref_name(df.iat[row_idx, 0]) if df.shape[1] > 0 else ""
+            if part:
+                fragments.append(part)
+        raw_region = "".join(fragments)
+        region = match_prefecture(raw_region)
+
+        # Prefer an exact label if a later table version already stores full names.
+        if region is None:
+            direct = [match_prefecture(df.iat[r, 0]) for r in group_rows]
+            direct = [item for item in direct if item]
+            if len(set(direct)) == 1:
+                region = direct[0]
+
+        # National subtotal may be split across cells as 全国; don't add it as a prefecture.
+        if raw_region in {"全国", "全國"}:
+            continue
+        if region is None:
+            unresolved.append(f"行{start_row + 1}: 地域ラベルの分割片={fragments!r}")
+            continue
+
+        for row_idx in group_rows:
+            relation = category_at(row_idx)
+            for col_idx, base_label in header_labels.items():
+                value = numeric_value(df.iat[row_idx, col_idx])
+                if value is None:
+                    continue
+                measure = measure_headers[col_idx]
+                # Use explicit Japanese names and avoid treating count and floor area as the same unit.
+                metric_parts = [p for p in base_label.split("／") if p]
+                if relation != "計":
+                    metric_parts.insert(max(1, len(metric_parts) - 1), relation)
+                label = "／".join(dict.fromkeys(metric_parts))
+                unit = "㎡" if ("床面積" in measure or "平方メートル" in measure) else ("戸" if "戸数" in measure else default_unit)
+                records.append({
+                    "年月": period,
+                    "地域": region,
+                    "指標": label,
+                    "値": value,
+                    "単位": unit,
+                    "頻度": "年次",
+                    "出典": dataset_name,
+                    "シート": str(sheet_name),
+                })
+
+    if not records:
+        detail = "。".join(unresolved[:5]) if unresolved else "抽出条件に一致する数値がありません"
+        return None, f"縦方向に分割された都道府県名から数値を抽出できない: {detail}"
+
+    result = pd.DataFrame(records)
+    result["年月"] = pd.to_datetime(result["年月"])
+    result["値"] = pd.to_numeric(result["値"], errors="coerce")
+    result = result.dropna(subset=["値"])
+    result = result.drop_duplicates(subset=["年月", "地域", "指標"], keep="first")
+    return result, None
+
+
 def parse_regional_metric_workbook(sheets, frequency="月次", dataset_name="e-Stat統計表", default_unit="値"):
     """Parse regional e-Stat Excel tables in either prefecture-row or prefecture-column orientation.
 
@@ -734,6 +886,20 @@ def parse_regional_metric_workbook(sheets, frequency="月次", dataset_name="e-S
         if period is None:
             debug.append(f"{sheet_name}: 年月・年次を判定できない")
             continue
+
+        # Historical annual housing structure tables split prefecture names vertically across
+        # utilization rows. Parse that layout explicitly before the generic exact-label parser.
+        if frequency == "年次":
+            top_text = "".join(clean_text(v) for v in df.head(10).fillna("").values.flatten().tolist())
+            if "構造別" in top_text and "建て方別" in top_text and "利用関係別" in top_text and "床面積の合計" in top_text:
+                special_data, special_error = _parse_legacy_structure_table(
+                    df, period, sheet_name, dataset_name, default_unit=default_unit
+                )
+                if special_data is not None and not special_data.empty:
+                    records.extend(special_data.to_dict("records"))
+                else:
+                    debug.append(f"{sheet_name}: {special_error or '旧形式の構造別表を解析できない'}")
+                continue
 
         # Find both possible table orientations.
         pref_columns = []
