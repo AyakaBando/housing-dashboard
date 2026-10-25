@@ -571,12 +571,20 @@ def make_pdf_chart_image(
     start_date,
     end_date,
 ) -> io.BytesIO:
-    """Render a chart PNG for the PDF using Matplotlib; English axis labels avoid missing CJK fonts."""
+    """PDF用グラフを日本語ラベルで描画する。"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     from matplotlib.ticker import FuncFormatter
+    from matplotlib import font_manager
+    # Linux/Streamlit Cloudにある日本語フォントを優先して使用
+    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    for font_name in ["Noto Sans CJK JP", "Noto Serif CJK JP", "IPAexGothic"]:
+        if font_name in available_fonts:
+            plt.rcParams["font.family"] = font_name
+            break
+    plt.rcParams["axes.unicode_minus"] = False
 
     value_col = "値" if display_measure == "着工戸数（戸）" else "前年比（％）"
     plot_data = metric_frame[["年月", value_col]].copy()
@@ -586,7 +594,7 @@ def make_pdf_chart_image(
 
     fig, ax = plt.subplots(figsize=(7.2, 3.0), dpi=150)
     if plot_data.empty:
-        ax.text(0.5, 0.5, "No data in selected period", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.5, "選択期間にデータがありません", ha="center", va="center", transform=ax.transAxes)
         ax.set_xticks([])
         ax.set_yticks([])
     else:
@@ -601,22 +609,22 @@ def make_pdf_chart_image(
             ax.plot(x, y, linewidth=1.5)
         if value_col == "前年比（％）":
             ax.axhline(0, linewidth=0.9, linestyle="--")
-            ax.set_ylabel("Year-over-year (%)")
+            ax.set_ylabel("前年比（％）")
             ax.yaxis.set_major_formatter(FuncFormatter(lambda value, pos: f"{value:.0f}%"))
         else:
-            ax.set_ylabel("Housing starts (units)")
+            ax.set_ylabel("着工戸数（戸）")
             ax.yaxis.set_major_formatter(FuncFormatter(lambda value, pos: f"{value:,.0f}"))
         span_months = max(0, (end_date.year - start_date.year) * 12 + end_date.month - start_date.month)
         if span_months > 36:
             ax.xaxis.set_major_locator(mdates.YearLocator())
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y年"))
         elif span_months > 12:
             ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y年%m月"))
         else:
             ax.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, span_months // 6 or 1)))
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-        ax.set_xlabel("Month")
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y年%m月"))
+        ax.set_xlabel("年月")
         ax.grid(True, axis="both", alpha=0.25)
         ax.tick_params(axis="x", labelrotation=25, labelsize=7)
         ax.tick_params(axis="y", labelsize=7)
@@ -632,7 +640,6 @@ def create_dashboard_pdf(
     chart_items: list[tuple[str, pd.DataFrame]],
     region_label: str,
     display_measure: str,
-    chart_type: str,
     start_date,
     end_date,
     dataset_info: str,
@@ -672,7 +679,7 @@ def create_dashboard_pdf(
         pdf.drawString(
             margin,
             page_height - 47,
-            f"地域：{region_label}　期間：{start_date.strftime('%Y年%m月')}～{end_date.strftime('%Y年%m月')}　表示：{display_measure}　グラフ：{chart_type}",
+            f"地域：{region_label}　期間：{start_date.strftime('%Y年%m月')}～{end_date.strftime('%Y年%m月')}　表示：{display_measure}",
         )
         pdf.setLineWidth(0.6)
         pdf.line(margin, page_height - 55, page_width - margin, page_height - 55)
@@ -692,8 +699,9 @@ def create_dashboard_pdf(
                 pdf.setFont("HeiseiKakuGo-W5", 7)
                 pdf.drawRightString(x + col_width, title_y, "※分譲住宅の内数")
 
+            metric_chart_type = "棒" if metric in {"分譲マンション（内数）", "分譲一戸建て（内数）"} else "折れ線"
             image_buffer = make_pdf_chart_image(
-                frame, display_measure, chart_type, start_date, end_date
+                frame, display_measure, metric_chart_type, start_date, end_date
             )
             pdf.drawImage(
                 ImageReader(image_buffer), x, image_y,
@@ -785,7 +793,6 @@ with st.sidebar:
     )
     start_date = st.date_input("開始月", value=min_date, min_value=min_date, max_value=max_date)
     end_date = st.date_input("終了月", value=max_date, min_value=min_date, max_value=max_date)
-    chart_type = st.selectbox("グラフ形式（全グラフ共通）", ["折れ線", "棒", "面"], index=0)
 
 if start_date > end_date:
     st.error("開始月は終了月以前の日付を指定してください。")
@@ -847,10 +854,9 @@ for idx in range(0, len(chart_items), 2):
                     x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
                 )
             else:
-                if chart_type == "棒":
+                # 時系列の変化は折れ線、内数の指標は棒グラフで比較しやすく表示
+                if metric in {"分譲マンション（内数）", "分譲一戸建て（内数）"}:
                     fig = px.bar(plot_data, x="年月", y=value_col)
-                elif chart_type == "面":
-                    fig = px.area(plot_data, x="年月", y=value_col)
                 else:
                     fig = px.line(plot_data, x="年月", y=value_col, markers=False)
             span_months = max(0, (end_date.year - start_date.year) * 12 + end_date.month - start_date.month)
@@ -867,7 +873,7 @@ for idx in range(0, len(chart_items), 2):
                 margin=dict(l=10, r=10, t=15, b=10),
                 showlegend=False,
                 xaxis_title="年月",
-                yaxis_title=display_measure,
+                yaxis_title="前年比（％）" if display_measure == "前年比（％）" else "着工戸数（戸）",
             )
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             figures.append((metric, metric_frame))
@@ -877,7 +883,7 @@ if "分譲マンション（内数）" in available_metrics or "分譲一戸建�
 
 # Export PDF for all chart panels, spread over as many landscape A4 pages as needed.
 pdf_signature = "|".join([
-    selected_region, display_measure, str(start_date), str(end_date), chart_type,
+    selected_region, display_measure, str(start_date), str(end_date),
     ",".join(available_metrics),
 ])
 if st.session_state.get("dashboard_pdf_signature") != pdf_signature:
@@ -886,7 +892,7 @@ if st.session_state.get("dashboard_pdf_signature") != pdf_signature:
 
 st.divider()
 st.subheader("グラフ全体をPDFに保存")
-st.write("上に表示されているすべての指標グラフを、横向きA4の複数ページPDFにまとめます。データ一覧表やCSVは出力しません。")
+st.write("上に表示されているすべての指標グラフを、横向きA4の複数ページPDFにまとめます。")
 if st.button("グラフ全体のPDFを作成", type="primary"):
     try:
         with st.spinner("全グラフをPDFにまとめています..."):
@@ -894,7 +900,6 @@ if st.button("グラフ全体のPDFを作成", type="primary"):
                 chart_items=chart_items,
                 region_label=region_label,
                 display_measure=display_measure,
-                chart_type=chart_type,
                 start_date=start_date,
                 end_date=end_date,
                 dataset_info=dataset_info,
