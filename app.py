@@ -10,6 +10,8 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+APP_VERSION = "A4-PDF v5"
+
 # The e-Stat monthly timeseries list. "layout=dataset" is used by the current listing.
 ESTAT_HOUSING_LIST_URL = (
     "https://www.e-stat.go.jp/stat-search/files"
@@ -673,6 +675,8 @@ def _infer_unit(sheets, default="値"):
     )
     if "億円" in joined:
         return "億円"
+    if "万円" in joined:
+        return "万円"
     if "千平方メートル" in joined or "千㎡" in joined or "千平米" in joined:
         return "千㎡"
     if "平方メートル" in joined or "㎡" in joined or "平米" in joined:
@@ -687,6 +691,10 @@ def _infer_unit(sheets, default="値"):
 def _unit_for_metric(label, default_unit, workbook_unit):
     """Choose a unit per series when one Excel contains both counts and floor area."""
     text = clean_text(label)
+    if any(token in text for token in ("工事費予定額", "工事費", "建設費", "請負金額")):
+        if "億円" in text or workbook_unit == "億円":
+            return "億円"
+        return "万円"
     if any(token in text for token in ("床面積", "面積の合計", "㎡", "平方メートル", "平米")):
         return workbook_unit if workbook_unit in {"㎡", "千㎡"} else "㎡"
     if any(token in text for token in ("戸数", "着工戸数", "住宅戸数")):
@@ -1484,7 +1492,7 @@ def create_dashboard_pdf(region_label, start_date, end_date, latest_month, cards
         pdf.setFillColor(grey)
         pdf.setFont(font, 7)
         pdf.drawString(margin, 16, "出典：e-Stat 建築着工統計調査")
-        pdf.drawRightString(page_width - margin, 16, f"{page_no} / 2")
+        pdf.drawRightString(page_width - margin, 16, f"{page_no} / 2　A4 v5")
 
     # Page 1: KPI cards in a 3x2 grid, then a large full-width trend chart.
     draw_header("市場概況・住宅着工戸数の推移", 1)
@@ -1553,18 +1561,38 @@ def create_dashboard_pdf(region_label, start_date, end_date, latest_month, cards
 
 
 def _chart_display_unit(values, unit):
-    """Choose a compact Japanese scale for large floor-area values."""
-    import numpy as np
+    """Choose human-readable Japanese units and avoid scientific notation on large values."""
     series = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
     max_abs = float(series.abs().max()) if not series.empty else 0.0
     normalized_unit = str(unit or "").replace(" ", "").replace("　", "")
     factor, display_unit = 1.0, normalized_unit or "値"
 
-    if normalized_unit in {"㎡", "m²", "m2", "平方メートル", "平米"}:
+    is_area = any(token in normalized_unit for token in ("㎡", "m²", "m2", "平方メートル", "平米"))
+    is_currency_man = "万円" in normalized_unit
+    is_currency_oku = "億円" in normalized_unit
+    is_yen = ("円" in normalized_unit) and not (is_currency_man or is_currency_oku)
+
+    if is_area:
         if max_abs >= 100_000_000:
             factor, display_unit = 100_000_000.0, "億㎡"
         elif max_abs >= 10_000:
             factor, display_unit = 10_000.0, "万㎡"
+        else:
+            display_unit = "㎡"
+    elif is_currency_man:
+        if max_abs >= 10_000:
+            factor, display_unit = 10_000.0, "億円"
+        else:
+            display_unit = "万円"
+    elif is_currency_oku:
+        display_unit = "億円"
+    elif is_yen:
+        if max_abs >= 100_000_000:
+            factor, display_unit = 100_000_000.0, "億円"
+        elif max_abs >= 10_000:
+            factor, display_unit = 10_000.0, "万円"
+        else:
+            display_unit = "円"
     elif normalized_unit in {"千㎡", "千m²", "千平方メートル"}:
         if max_abs >= 100_000:
             factor, display_unit = 100_000.0, "億㎡"
@@ -1573,61 +1601,84 @@ def _chart_display_unit(values, unit):
     return factor, display_unit
 
 
-def _compact_category_label(value, max_chars=24):
-    """Shorten multi-level e-Stat labels while preserving the distinctions being compared."""
+def _compact_category_label(value, max_chars=18):
+    """Make e-Stat's long compound labels readable in charts and PDF exports."""
     import unicodedata
+
     text = unicodedata.normalize("NFKC", str(value or ""))
-    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[\s\u3000]+", "", text)
+    text = text.replace("，", "、").replace("；", "、")
+
     replacements = [
         ("鉄骨鉄筋コンクリート造", "SRC造"),
         ("鉄筋コンクリート造", "RC造"),
         ("コンクリートブロック造", "CB造"),
         ("鉄骨造", "S造"),
+        ("木造", "木造"),
         ("非住宅建築物", "非住宅"),
-        ("床面積の合計", "床面積"),
-        ("建築物の数", "棟数"),
+        ("共同住宅", "共同住宅"),
         ("一戸建て", "戸建"),
         ("一戸建", "戸建"),
         ("長屋建て", "長屋"),
         ("長屋建", "長屋"),
+        ("床面積の合計", "床面積"),
+        ("建築物の数", "棟数"),
+        ("工事費予定額", "工事費"),
     ]
     for old, new in replacements:
         text = text.replace(old, new)
 
     raw_parts = re.split(r"[／/｜|]+", text)
+    # Old e-Stat workbooks prepend the whole table heading to every metric label,
+    # e.g. "構造別、用途別―建築物の数、床面積の合計、工事費予定額／S造／事務所／…".
+    # Drop that repeated preamble when actual category components follow it.
+    if len(raw_parts) > 1 and any(
+        token in raw_parts[0] for token in ("構造別", "用途別", "利用関係別", "建築物の数", "新設住宅の戸数")
+    ):
+        raw_parts = raw_parts[1:]
     parts = []
+    measure_words = {
+        "構造別", "用途別", "建て方別", "利用関係別", "都道府県別",
+        "戸数", "棟数", "床面積", "値", "計", "総数", "総計",
+        "平方メートル", "千平方メートル", "平米", "㎡", "m2", "m²",
+        "円", "万円", "億円", "戸", "棟", "工事費", "工事費/万円",
+    }
     for part in raw_parts:
-        part = part.strip("・_－-:：")
-        if not part or part in {"構造別", "用途別", "建て方別", "利用関係別", "都道府県別", "戸数", "床面積", "値", "計", "総数", "総計"}:
+        part = part.strip("・_－-―—:：,、")
+        if not part:
             continue
-        if part not in parts:
+        # Remove generic table-level descriptions repeated in almost every column.
+        for generic in (
+            "構造別", "用途別", "建て方別", "利用関係別", "都道府県別",
+            "床面積の合計", "建築物の数", "工事費予定額", "新設建築物",
+        ):
+            part = part.replace(generic, "")
+        part = part.strip("・_－-―—:：,、")
+        if not part or part in measure_words:
+            continue
+        # A unit or measure ending is not a category, and should not repeat as a label.
+        if part in {"床面積", "棟数", "戸数", "万円", "億円", "平方メートル", "千平方メートル"}:
+            continue
+        # If one remaining component still carries an e-Stat combined measure description, strip it.
+        part = part.replace("床面積", "").replace("工事費", "").replace("棟数", "")
+        part = part.strip("・_－-―—:：,、")
+        if part and part not in parts:
             parts.append(part)
-    if not parts:
-        parts = [text or "全体"]
-    compact = "・".join(parts)
 
-    # Wrap only at meaningful category boundaries. For unusually long single labels,
-    # split by character to prevent the label from pushing the plot out of its page.
+    if not parts:
+        # Fallback to a compact source label rather than producing an empty label.
+        fallback = text
+        for generic in ("構造別", "用途別", "建て方別", "利用関係別", "都道府県別",
+                        "床面積の合計", "建築物の数", "工事費予定額", "平方メートル"):
+            fallback = fallback.replace(generic, "")
+        fallback = re.sub(r"[／/｜|]+", "・", fallback).strip("・_－-:：,、")
+        parts = [fallback or "全体"]
+
+    compact = "・".join(parts)
     if len(compact) <= max_chars:
         return compact
-    lines, current = [], ""
-    for part in parts:
-        if len(part) > max_chars:
-            if current:
-                lines.append(current)
-                current = ""
-            for offset in range(0, len(part), max_chars):
-                lines.append(part[offset:offset + max_chars])
-        elif not current:
-            current = part
-        elif len(current) + 1 + len(part) <= max_chars:
-            current += "・" + part
-        else:
-            lines.append(current)
-            current = part
-    if current:
-        lines.append(current)
-    return "\n".join(lines)
+    # Prefer keeping structural and use-type terms at the front; trim only the tail.
+    return compact[:max_chars - 1] + "…"
 
 
 def _render_generic_pdf_chart(spec):
@@ -1662,6 +1713,7 @@ def _render_generic_pdf_chart(spec):
         ax.set_yticks(y_positions)
         ax.set_yticklabels(labels)
         ax.set_xlabel(f"値（{display_unit}）", fontsize=10)
+        ax.ticklabel_format(axis="x", style="plain", useOffset=False)
         ax.xaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:,.0f}" if abs(v) >= 10 else f"{v:,.1f}".rstrip("0").rstrip(".")))
         ax.tick_params(axis="y", labelsize=8.5, pad=7)
         ax.tick_params(axis="x", labelsize=8.5)
@@ -1674,6 +1726,7 @@ def _render_generic_pdf_chart(spec):
             ax.plot(pd.to_datetime(group["年月"]), pd.to_numeric(group["_表示値"], errors="coerce"),
                     label=_compact_category_label(label, max_chars=24), linewidth=1.8)
         ax.set_ylabel(display_unit, fontsize=10)
+        ax.ticklabel_format(axis="y", style="plain", useOffset=False)
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=8))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y年%m月"))
         ax.tick_params(axis="x", labelrotation=20, labelsize=8.5)
@@ -1740,7 +1793,7 @@ def create_multi_chart_pdf(title, region_label, period_label, specs):
         pdf.setFont(font, 7)
         pdf.setFillColor(colors.HexColor("#64748b"))
         pdf.drawString(margin, 16, "出典：e-Stat 公開統計表")
-        pdf.drawRightString(width - margin, 16, f"{page_no} / {total_pages}")
+        pdf.drawRightString(width - margin, 16, f"{page_no} / {total_pages}　A4 v5")
         pdf.showPage()
 
     pdf.save()
@@ -1820,13 +1873,73 @@ def create_status_pdf(title, region_label, period_label, message, source_url=Non
 
 
 def merge_pdf_documents(documents):
-    """Merge PDFs from every analysis screen into a single downloadable file."""
-    from pypdf import PdfWriter
+    """Merge all report sections, normalize every page to true A4 landscape, and number globally."""
     import io
-    writer = PdfWriter()
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from pypdf.generic import RectangleObject
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfgen import canvas
+
+    target_width, target_height = [float(value) for value in landscape(A4)]
+    pages = []
     for _title, pdf_bytes in documents:
-        if pdf_bytes:
-            writer.append(io.BytesIO(pdf_bytes))
+        if not pdf_bytes:
+            continue
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            # Normalize rotation before measuring the page.
+            try:
+                page.transfer_rotation_to_content()
+            except Exception:
+                pass
+            source_width = float(page.mediabox.width)
+            source_height = float(page.mediabox.height)
+            if source_width <= 0 or source_height <= 0:
+                continue
+            scale = min(target_width / source_width, target_height / source_height)
+            offset_x = (target_width - source_width * scale) / 2
+            offset_y = (target_height - source_height * scale) / 2
+            page.add_transformation(Transformation().scale(scale).translate(tx=offset_x, ty=offset_y))
+            page.mediabox = RectangleObject([0, 0, target_width, target_height])
+            page.cropbox = RectangleObject([0, 0, target_width, target_height])
+            page.trimbox = RectangleObject([0, 0, target_width, target_height])
+            pages.append(page)
+
+    if not pages:
+        raise RuntimeError("PDFに含めるページがありません。")
+
+    # Add a single, consistent footer after normalization. This also makes it easy to
+    # verify that the latest export path is being used and gives a report-wide page count.
+    overlay_bytes = io.BytesIO()
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+        footer_font = "HeiseiKakuGo-W5"
+    except Exception:
+        footer_font = "Helvetica"
+    overlay = canvas.Canvas(overlay_bytes, pagesize=(target_width, target_height), pageCompression=1)
+    overlay.setTitle(f"住宅市場分析レポート - {APP_VERSION}")
+    for page_number in range(1, len(pages) + 1):
+        overlay.setFillColor(colors.HexColor("#667085"))
+        overlay.setFont(footer_font, 7)
+        overlay.drawString(24, 10, "住宅市場分析レポート　A4横")
+        overlay.drawRightString(target_width - 24, 10, f"{page_number} / {len(pages)}")
+        overlay.showPage()
+    overlay.save()
+    overlay_bytes.seek(0)
+    overlay_reader = PdfReader(overlay_bytes)
+
+    writer = PdfWriter()
+    for index, page in enumerate(pages):
+        page.merge_page(overlay_reader.pages[index])
+        writer.add_page(page)
+    writer.add_metadata({
+        "/Title": "住宅市場分析レポート",
+        "/Author": "住宅市場分析ダッシュボード",
+        "/Subject": f"統合PDF・A4横・全{len(pages)}ページ・{APP_VERSION}",
+    })
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
@@ -2002,6 +2115,7 @@ div[data-testid="stRadio"] label {font-weight:600;}
 st.title("住宅着工統計ダッシュボード")
 
 with st.sidebar:
+    st.caption(f"PDF出力形式：{APP_VERSION}")
     st.header("① 地域を選択")
     if st.button("e-Statからデータを再取得", use_container_width=True, help="最新のExcelを取得します"):
         st.cache_data.clear()
