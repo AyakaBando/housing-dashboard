@@ -608,12 +608,13 @@ def make_pdf_chart_image(
     # Import after pyplot and explicitly set the family so PDF graph images do not use
     # the default Latin-only font on Streamlit Community Cloud.
     try:
-        import japanize_matplotlib_modern  # noqa: F401
+        import matplotlib_fontja  # noqa: F401
+        # matplotlib-fontja bundles IPAex Gothic and registers it for Matplotlib.
         plt.rcParams["font.family"] = "IPAexGothic"
     except Exception as exc:
         raise RuntimeError(
             "PDFグラフ用の日本語フォントを読み込めませんでした。"
-            "requirements.txt の japanize-matplotlib-modern のインストール後に再デプロイしてください。"
+            "requirements.txt に matplotlib-fontja が含まれていることを確認して再デプロイしてください。"
         ) from exc
     plt.rcParams["axes.unicode_minus"] = False
 
