@@ -1,5 +1,7 @@
 import io
+import json
 import re
+import unicodedata
 from datetime import date, datetime
 from urllib.parse import urljoin
 
@@ -10,7 +12,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-APP_VERSION = "A4-PDF v7・旧形式構造表対応"
+APP_VERSION = "A4-PDF v10・市区町村／都道府県／全国比較"
 
 # The e-Stat monthly timeseries list. "layout=dataset" is used by the current listing.
 ESTAT_HOUSING_LIST_URL = (
@@ -1172,6 +1174,831 @@ def load_renovation_api_data(app_id: str) -> tuple[pd.DataFrame, str]:
     return result_df.sort_values(["年月", "地域", "指標"]).reset_index(drop=True), ESTAT_RENOVATION_TABLE_URL
 
 
+# -----------------------------------------------------------------------------
+# Municipality / housing acquisition environment (e-Stat API)
+# -----------------------------------------------------------------------------
+ESTAT_MUNICIPAL_BUILDING_STATS_ID = "0004019380"  # 市区町村別・構造別 建築物の数/床面積
+ESTAT_HOUSEHOLD_INCOME_STATS_ID = "0004021668"    # 2023住宅・土地統計調査 年間収入階級
+ESTAT_HOUSING_COST_STATS_ID = "0003114524"        # 新築住宅の工事費（構造・建て方・利用関係別）
+ESTAT_MUNICIPAL_BUILDING_URL = "https://www.e-stat.go.jp/stat-search/database?statdisp_id=0004019380"
+ESTAT_HOUSEHOLD_INCOME_URL = "https://www.e-stat.go.jp/stat-search/database?statdisp_id=0004021668"
+ESTAT_HOUSING_COST_URL = "https://www.e-stat.go.jp/stat-search/database?statdisp_id=0003114524"
+TSUBO_M2 = 3.305785
+
+
+def _as_estat_list(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def load_estat_table_metadata(app_id: str, stats_data_id: str) -> list:
+    """Load and normalize e-Stat CLASS_INF metadata for a table."""
+    if not app_id:
+        raise RuntimeError("ESTAT_APP_ID が設定されていません。")
+    url = "https://api.e-stat.go.jp/rest/2.1/app/json/getMetaInfo"
+    response = requests.get(
+        url,
+        params={"appId": app_id, "statsDataId": stats_data_id, "lang": "J"},
+        headers=HEADERS,
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json().get("GET_META_INFO", {}) or {}
+    result = payload.get("RESULT", {}) or {}
+    if str(result.get("STATUS", "0")) != "0":
+        raise RuntimeError(f"e-StatメタデータAPIエラー: {result.get('ERROR_MSG', result)}")
+    class_inf = (payload.get("METADATA_INF", {}) or {}).get("CLASS_INF", {}) or {}
+    class_objs = _as_estat_list(class_inf.get("CLASS_OBJ"))
+    if not class_objs:
+        raise RuntimeError(f"統計表 {stats_data_id} の分類情報を取得できませんでした。")
+    dimensions = []
+    for obj in class_objs:
+        classes = []
+        for cls in _as_estat_list(obj.get("CLASS")):
+            classes.append({
+                "code": str(cls.get("@code", "")),
+                "name": str(cls.get("@name", cls.get("@code", ""))),
+                "level": str(cls.get("@level", "")),
+                "parent": str(cls.get("@parentCode", "")),
+                "unit": str(cls.get("@unit", "")),
+            })
+        dimensions.append({
+            "id": str(obj.get("@id", "")),
+            "name": str(obj.get("@name", obj.get("@id", ""))),
+            "classes": classes,
+        })
+    return dimensions
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def load_estat_table_values(app_id: str, stats_data_id: str, area_code: str, filters_json: str = "{}") -> list:
+    """Fetch one selected area from e-Stat. Per-area caching keeps the UI responsive."""
+    if not app_id:
+        raise RuntimeError("ESTAT_APP_ID が設定されていません。")
+    import json
+    filters = json.loads(filters_json or "{}")
+    params = {
+        "appId": app_id,
+        "statsDataId": stats_data_id,
+        "lang": "J",
+        "limit": 100000,
+        "cdArea": str(area_code),
+    }
+    params.update({str(k): str(v) for k, v in filters.items() if v not in (None, "")})
+    url = "https://api.e-stat.go.jp/rest/2.1/app/json/getStatsData"
+    response = requests.get(url, params=params, headers=HEADERS, timeout=90)
+    response.raise_for_status()
+    payload = response.json().get("GET_STATS_DATA", {}) or {}
+    result = payload.get("RESULT", {}) or {}
+    if str(result.get("STATUS", "0")) != "0":
+        raise RuntimeError(f"e-StatデータAPIエラー: {result.get('ERROR_MSG', result)}")
+    statistical = payload.get("STATISTICAL_DATA", {}) or {}
+    data_inf = statistical.get("DATA_INF", {}) or {}
+    values = _as_estat_list(data_inf.get("VALUE"))
+    if not values:
+        return []
+    return values
+
+
+def _estat_dim(dimensions, *tokens):
+    for dim in dimensions:
+        name = clean_text(dim.get("name", ""))
+        if all(token in name for token in tokens):
+            return dim
+    return None
+
+
+def _estat_class(dim, exact=None, contains=None):
+    if not dim:
+        return None
+    exact_norm = clean_text(exact) if exact else None
+    contains_norm = clean_text(contains) if contains else None
+    classes = dim.get("classes", [])
+    for cls in classes:
+        name = clean_text(cls.get("name", ""))
+        if exact_norm and name == exact_norm:
+            return cls
+    for cls in classes:
+        name = clean_text(cls.get("name", ""))
+        if contains_norm and contains_norm in name:
+            return cls
+    return None
+
+
+def _estat_area_catalog(dimensions):
+    area_dim = _estat_dim(dimensions, "地域") or _estat_dim(dimensions, "施工地域")
+    if not area_dim:
+        raise RuntimeError("統計表の分類情報に地域項目がありません。")
+    return area_dim
+
+
+def _find_area_code(dimensions, area_name):
+    area_dim = _estat_area_catalog(dimensions)
+    target = clean_text(area_name)
+    for cls in area_dim.get("classes", []):
+        if clean_text(cls.get("name", "")) == target:
+            return cls.get("code")
+    if target == "全国":
+        national = _estat_class(area_dim, exact="全国") or _estat_class(area_dim, contains="全国")
+        return national.get("code") if national else "00000"
+    return None
+
+
+def _municipality_options(dimensions, prefecture):
+    area_dim = _estat_area_catalog(dimensions)
+    pref_class = None
+    for cls in area_dim.get("classes", []):
+        if match_prefecture(cls.get("name", "")) == prefecture:
+            pref_class = cls
+            break
+    if not pref_class:
+        raise RuntimeError(f"{prefecture}の地域コードを統計表から特定できません。")
+    pref_code = str(pref_class.get("code", ""))
+    prefix = pref_code[:2]
+    options = []
+    for cls in area_dim.get("classes", []):
+        code = str(cls.get("code", ""))
+        name = str(cls.get("name", "")).strip()
+        if not code or not name or code == pref_code or len(code) != 5 or not code.startswith(prefix):
+            continue
+        if name == "全国" or match_prefecture(name):
+            continue
+        # Exclude aggregate / obsolete records; normal municipality and ward codes are five digits.
+        if any(token in name for token in ("合計", "その他", "不詳")):
+            continue
+        options.append({"code": code, "name": name, "label": f"{name}（{code}）"})
+    options.sort(key=lambda x: (x["name"], x["code"]))
+    return pref_code, options
+
+
+def _parse_estat_api_rows(dimensions, values):
+    """Convert e-Stat VALUE rows to a flat frame with all classification labels."""
+    maps = {
+        dim["id"]: {str(c["code"]): str(c["name"]) for c in dim.get("classes", [])}
+        for dim in dimensions
+    }
+    names = {dim["id"]: dim["name"] for dim in dimensions}
+    time_dim = next((d for d in dimensions if any(x in clean_text(d["name"]) for x in ("時間軸", "年次", "年度", "調査年"))), None)
+    area_dim = next((d for d in dimensions if "地域" in clean_text(d["name"])), None)
+    measure_dim = next((d for d in dimensions if any(t in clean_text(d["name"]) for t in ("表章項目", "項目"))), None)
+    records = []
+    for item in values:
+        val = numeric_value(item.get("$"))
+        if val is None:
+            continue
+        attrs = {str(k).lstrip("@"): str(v) for k, v in item.items() if str(k).startswith("@")}
+        row = {"値": float(val), "単位": str(item.get("@unit", ""))}
+        for dim_id, dim_name in names.items():
+            code = attrs.get(dim_id, "")
+            row[dim_name] = maps.get(dim_id, {}).get(code, code)
+            row[f"{dim_name}_コード"] = code
+        if area_dim:
+            area_code = attrs.get(area_dim["id"], "")
+            row["地域コード"] = area_code
+            row["地域名"] = maps.get(area_dim["id"], {}).get(area_code, area_code)
+        if time_dim:
+            time_code = attrs.get(time_dim["id"], "")
+            time_label = maps.get(time_dim["id"], {}).get(time_code, time_code)
+            row["時間"] = time_label
+            parsed_month = parse_month(time_label)
+            year = parsed_month.year if parsed_month is not None else parse_year_from_text(time_label)
+            if year:
+                row["年"] = int(year)
+                row["年月"] = parsed_month if parsed_month is not None else pd.Timestamp(year=int(year), month=1, day=1)
+        if measure_dim:
+            measure_code = attrs.get(measure_dim["id"], "")
+            row["表章項目"] = maps.get(measure_dim["id"], {}).get(measure_code, measure_code)
+        records.append(row)
+    return pd.DataFrame(records)
+
+
+def _api_filter_for_dimension(dim, class_code):
+    if not dim or not class_code:
+        return {}
+    dim_id = str(dim.get("id", ""))
+    if dim_id == "tab":
+        return {"cdTab": str(class_code)}
+    if dim_id == "area":
+        return {"cdArea": str(class_code)}
+    if dim_id == "time":
+        return {"cdTime": str(class_code)}
+    if dim_id.startswith("cat"):
+        return {"cd" + dim_id.capitalize(): str(class_code)}
+    return {}
+
+
+def load_area_table_frame(app_id, stats_data_id, dimensions, area_codes):
+    records = []
+    for area_code in dict.fromkeys(str(x) for x in area_codes if x):
+        raw = load_estat_table_values(app_id, stats_data_id, area_code)
+        if raw:
+            frame = _parse_estat_api_rows(dimensions, raw)
+            if not frame.empty:
+                records.append(frame)
+    if not records:
+        return pd.DataFrame()
+    combined = pd.concat(records, ignore_index=True)
+    return combined.drop_duplicates().reset_index(drop=True)
+
+
+def _canonical_area_name(dimensions, area_code, fallback=""):
+    """Resolve an e-Stat area code to its exact published Japanese label."""
+    try:
+        area_dim = _estat_area_catalog(dimensions)
+        for cls in area_dim.get("classes", []):
+            if str(cls.get("code", "")) == str(area_code):
+                return str(cls.get("name", fallback))
+    except Exception:
+        pass
+    return fallback or str(area_code)
+
+
+def _find_measure_dimension(dimensions, keywords):
+    """Find a classification dimension by inspecting its class labels, not only its title."""
+    for dim in dimensions:
+        labels = [clean_text(x.get("name", "")) for x in dim.get("classes", [])]
+        if any(any(word in label for word in keywords) for label in labels):
+            return dim
+    return None
+
+
+def _normalise_income_label(value):
+    text = unicodedata.normalize("NFKC", clean_text(value))
+    return text.replace(",", "").replace("，", "").replace("〜", "～").replace("~", "～")
+
+
+def make_income_summary(income_frame, area_names):
+    """Return income distribution and midpoint-estimated mean (not an official mean)."""
+    if income_frame is None or income_frame.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    income_dim_col = next((c for c in income_frame.columns if "年間収入階級" in str(c)), None)
+    if not income_dim_col:
+        # Fall back to the dimension whose class labels look like income bands.
+        for col in income_frame.columns:
+            vals = income_frame[col].astype(str).head(30).tolist()
+            if any("万円" in x for x in vals):
+                income_dim_col = col
+                break
+    tenure_dim_col = next((c for c in income_frame.columns if "所有の関係" in str(c)), None)
+    if not income_dim_col:
+        raise RuntimeError("年収階級の分類を特定できませんでした。")
+    frame = income_frame.copy()
+    if "表章項目" in frame.columns:
+        frame = frame[frame["表章項目"].map(clean_text).str.contains("主世帯数", na=False)]
+    if tenure_dim_col:
+        overall_tenure = frame[frame[tenure_dim_col].map(clean_text).str.contains("総数", na=False)]
+        if not overall_tenure.empty:
+            frame = overall_tenure
+
+    # Income classes are published as ranges. The top open-ended class uses 1,750万円
+    # as an explicit midpoint assumption; this is an estimate, not the published mean.
+    midpoint = {
+        "100万円未満": 50,
+        "100～150万円未満": 125, "100～150万円": 125,
+        "150～200万円未満": 175, "150～200万円": 175,
+        "200～300万円未満": 250, "200～300万円": 250,
+        "300～400万円未満": 350, "300～400万円": 350,
+        "400～500万円未満": 450, "400～500万円": 450,
+        "500～700万円未満": 600, "500～700万円": 600,
+        "700～1000万円未満": 850, "700～1000万円": 850,
+        "1000～1500万円未満": 1250, "1000～1500万円": 1250,
+        "1500万円以上": 1750,
+    }
+    total = {}
+    distribution_rows = []
+    for area in area_names:
+        area_rows = frame[frame["地域名"].map(clean_text) == clean_text(area)]
+        if area_rows.empty:
+            continue
+        vals = {_normalise_income_label(k): float(v) for k, v in area_rows.groupby(income_dim_col)["値"].sum().items()}
+        total_class = next((v for k, v in vals.items() if k == "総数"), None)
+        band_values = [(label, vals[label], mid) for label, mid in midpoint.items() if label in vals]
+        if not band_values:
+            # Accept variants such as 100万円未満/100～150万円未満 after NFKC normalization.
+            for label, count in vals.items():
+                for standard, mid in midpoint.items():
+                    if label == standard or label.replace("未満", "") == standard.replace("未満", ""):
+                        band_values.append((standard, count, mid))
+                        break
+        denom = total_class if total_class and total_class > 0 else sum(x[1] for x in band_values)
+        band_total = sum(x[1] for x in band_values)
+        if denom <= 0 or band_total <= 0:
+            continue
+        estimate = sum(count * mid for _, count, mid in band_values) / band_total
+        high_income = sum(count for label, count, _ in band_values if any(t in label for t in ("500～700", "700～1000", "1000～1500", "1500万円以上")))
+        total[area] = {
+            "推計平均世帯年収（万円）": estimate,
+            "500万円以上の世帯割合（％）": high_income / denom * 100,
+            "世帯数": denom,
+        }
+        for label, count, mid in band_values:
+            distribution_rows.append({
+                "地域": area, "年収階級": label, "世帯数": count,
+                "構成比": count / denom * 100,
+            })
+    summary = pd.DataFrame([{"地域": k, **v} for k, v in total.items()])
+    distribution = pd.DataFrame(distribution_rows)
+    return summary, distribution
+
+
+def build_municipal_dashboard_data(app_id, prefecture, municipality_code, municipality_name=None):
+    """Load municipality/prefecture/national construction, income and cost indicators.
+
+    Scope is stated per source: municipal wood-building statistics cover all uses;
+    household income is an income-class estimate; construction costs are prefectural/national.
+    One failed source does not stop the other two.
+    """
+    result = {
+        "building": pd.DataFrame(),
+        "income_summary": pd.DataFrame(),
+        "income_distribution": pd.DataFrame(),
+        "cost": pd.DataFrame(),
+        "errors": {},
+        "sources": {
+            "building": ESTAT_MUNICIPAL_BUILDING_URL,
+            "income": ESTAT_HOUSEHOLD_INCOME_URL,
+            "cost": ESTAT_HOUSING_COST_URL,
+        },
+    }
+
+    # 1) Municipal wood-building count and floor area, plus prefecture/national comparisons.
+    building_meta = None
+    city_name = municipality_name or str(municipality_code)
+    pref_code = None
+    try:
+        building_meta = load_estat_table_metadata(app_id, ESTAT_MUNICIPAL_BUILDING_STATS_ID)
+        building_area_dim = _estat_area_catalog(building_meta)
+        pref_code, _ = _municipality_options(building_meta, prefecture)
+        nat_cls = _estat_class(building_area_dim, exact="全国") or _estat_class(building_area_dim, contains="全国")
+        nat_code = nat_cls.get("code") if nat_cls else "00000"
+        city_name = _canonical_area_name(building_meta, municipality_code, city_name)
+        areas = [
+            (str(municipality_code), city_name),
+            (str(pref_code), prefecture),
+            (str(nat_code), "全国"),
+        ]
+        building_rows = load_area_table_frame(
+            app_id, ESTAT_MUNICIPAL_BUILDING_STATS_ID, building_meta, [x[0] for x in areas]
+        )
+        if not building_rows.empty:
+            structure_dim = next((d for d in building_meta if "構造" in clean_text(d["name"])), None)
+            measure_dim = next((d for d in building_meta if any(t in clean_text(d["name"]) for t in ("表章項目", "項目"))), None)
+            if not measure_dim:
+                measure_dim = _find_measure_dimension(building_meta, ("建築物の数", "床面積の合計"))
+            structure_col = structure_dim.get("name") if structure_dim else None
+            measure_col = measure_dim.get("name") if measure_dim else None
+            if structure_col and structure_col in building_rows.columns:
+                building_rows = building_rows[building_rows[structure_col].map(clean_text) == "木造"]
+            records = []
+            labels = {code: name for code, name in areas}
+            for _, row in building_rows.iterrows():
+                measure = clean_text(row.get(measure_col, "")) if measure_col else ""
+                if not ("建築物の数" in measure or "床面積の合計" in measure):
+                    continue
+                year = row.get("年")
+                if pd.isna(year):
+                    continue
+                code = str(row.get("地域コード", ""))
+                records.append({
+                    "年": int(year),
+                    "地域": labels.get(code, row.get("地域名", code)),
+                    "地域コード": code,
+                    "指標": measure,
+                    "値": float(row["値"]),
+                    "単位": str(row.get("単位", "")),
+                })
+            raw_building = pd.DataFrame(records)
+            if not raw_building.empty:
+                count = raw_building[raw_building["指標"].str.contains("建築物の数", na=False)][["年", "地域", "値"]].rename(columns={"値": "木造建築物数"})
+                area = raw_building[raw_building["指標"].str.contains("床面積の合計", na=False)][["年", "地域", "値"]].rename(columns={"値": "木造建築物床面積㎡"})
+                result["building"] = count.merge(area, on=["年", "地域"], how="outer")
+                result["building"]["平均床面積坪"] = (
+                    result["building"]["木造建築物床面積㎡"]
+                    / result["building"]["木造建築物数"] / TSUBO_M2
+                )
+        if result["building"].empty:
+            result["errors"]["building"] = "市区町村別・構造別の建築物データに数値がありません。"
+    except Exception as exc:
+        result["errors"]["building"] = str(exc)
+
+    # 2) 2023 Housing and Land Survey household annual-income classes.
+    try:
+        income_meta = load_estat_table_metadata(app_id, ESTAT_HOUSEHOLD_INCOME_STATS_ID)
+        income_area_dim = _estat_area_catalog(income_meta)
+        income_nat = _estat_class(income_area_dim, exact="全国") or _estat_class(income_area_dim, contains="全国")
+        income_pref_code = _find_area_code(income_meta, prefecture)
+        income_city_code = _find_area_code(income_meta, city_name)
+        if not income_city_code:
+            # The municipality JIS code often matches across e-Stat tables; use it only
+            # when that code is actually present in this table's area classification.
+            if any(str(c.get("code")) == str(municipality_code) for c in income_area_dim.get("classes", [])):
+                income_city_code = str(municipality_code)
+        income_nat_code = income_nat.get("code") if income_nat else "00000"
+        income_codes = [x for x in [income_city_code, income_pref_code, income_nat_code] if x]
+        income_rows = load_area_table_frame(app_id, ESTAT_HOUSEHOLD_INCOME_STATS_ID, income_meta, income_codes)
+        available_codes = set(income_rows.get("地域コード", pd.Series(dtype=str)).astype(str))
+        income_label_map = {}
+        if income_city_code and str(income_city_code) in available_codes:
+            income_label_map[str(income_city_code)] = city_name
+        if income_pref_code and str(income_pref_code) in available_codes:
+            income_label_map[str(income_pref_code)] = prefecture
+        if income_nat_code and str(income_nat_code) in available_codes:
+            income_label_map[str(income_nat_code)] = "全国"
+        if not income_rows.empty:
+            income_rows["地域名"] = income_rows["地域コード"].astype(str).map(income_label_map).fillna(income_rows["地域名"])
+        income_area_names = list(income_label_map.values())
+        result["income_summary"], result["income_distribution"] = make_income_summary(income_rows, income_area_names)
+        if result["income_summary"].empty:
+            result["errors"]["income"] = "年収階級の市区町村データを取得できませんでした。対象地域外の可能性があります。"
+    except Exception as exc:
+        result["errors"]["income"] = str(exc)
+
+    # 3) Construction costs are published as prefecture/national benchmarks, not city values.
+    try:
+        cost_meta = load_estat_table_metadata(app_id, ESTAT_HOUSING_COST_STATS_ID)
+        cost_area_dim = _estat_area_catalog(cost_meta)
+        cost_nat = _estat_class(cost_area_dim, exact="全国") or _estat_class(cost_area_dim, contains="全国")
+        cost_pref_code = _find_area_code(cost_meta, prefecture)
+        cost_nat_code = cost_nat.get("code") if cost_nat else "00000"
+        cost_codes = [x for x in [cost_pref_code, cost_nat_code] if x]
+        cost_rows = load_area_table_frame(app_id, ESTAT_HOUSING_COST_STATS_ID, cost_meta, cost_codes)
+        if not cost_rows.empty:
+            use_dim = next((d for d in cost_meta if "利用関係" in clean_text(d["name"])), None)
+            form_dim = next((d for d in cost_meta if "建て方" in clean_text(d["name"])), None)
+            structure_dim = next((d for d in cost_meta if "構造" in clean_text(d["name"])), None)
+            measure_dim = next((d for d in cost_meta if any(t in clean_text(d["name"]) for t in ("表章項目", "項目"))), None)
+            if not measure_dim:
+                measure_dim = _find_measure_dimension(cost_meta, ("工事費予定額", "床面積", "戸数"))
+            for dim, target in ((use_dim, "持家"), (form_dim, "一戸建"), (structure_dim, "木造")):
+                col = dim.get("name") if dim else None
+                if col and col in cost_rows.columns:
+                    cost_rows = cost_rows[cost_rows[col].map(lambda x: target in clean_text(x))]
+            region_labels = {str(code): name for code, name in [(cost_pref_code, prefecture), (cost_nat_code, "全国")] if code}
+            metric_col = measure_dim.get("name") if measure_dim else "表章項目"
+            records = []
+            for _, row in cost_rows.iterrows():
+                year = row.get("年")
+                if pd.isna(year):
+                    continue
+                code = str(row.get("地域コード", ""))
+                metric = str(row.get(metric_col, ""))
+                if not metric:
+                    continue
+                records.append({
+                    "年": int(year),
+                    "年月": row.get("年月", pd.Timestamp(year=int(year), month=1, day=1)),
+                    "地域": region_labels.get(code, row.get("地域名", code)),
+                    "指標": metric,
+                    "値": float(row["値"]),
+                    "単位": str(row.get("単位", "")),
+                })
+            result["cost"] = pd.DataFrame(records)
+        if result["cost"].empty:
+            result["errors"]["cost"] = "住宅工事費統計のAPIデータが空でした。e-Stat表34の提供状況をご確認ください。"
+    except Exception as exc:
+        result["errors"]["cost"] = str(exc)
+
+    result["municipality_name"] = city_name
+    return result
+
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def cached_municipal_dashboard_data(app_id, prefecture, municipality_code, municipality_name):
+    return build_municipal_dashboard_data(app_id, prefecture, municipality_code, municipality_name)
+
+
+def _unit_to_man_yen(value, unit):
+    """Convert monetary amounts to 万円 using the published unit label."""
+    u = unicodedata.normalize("NFKC", clean_text(unit)).replace("／", "/")
+    v = float(value)
+    if "億円" in u:
+        return v * 10000
+    if "百万円" in u:
+        return v * 100
+    if "万円" in u:
+        return v
+    if "千円" in u:
+        return v / 10
+    if "円" in u:
+        return v / 10000
+    return None
+
+
+def _unit_to_sqm(value, unit):
+    """Convert published area values to square metres."""
+    u = unicodedata.normalize("NFKC", clean_text(unit))
+    v = float(value)
+    if "億㎡" in u or "億平方メートル" in u:
+        return v * 100000000
+    if "万㎡" in u or "万平方メートル" in u:
+        return v * 10000
+    if "千㎡" in u or "千平方メートル" in u:
+        return v * 1000
+    if "㎡" in u or "m2" in u.lower() or "平方メートル" in u:
+        return v
+    return None
+
+
+def _estimate_cost_per_tsubo(row):
+    metric = unicodedata.normalize("NFKC", clean_text(row.get("指標", ""))).lower()
+    per_sqm_terms = (
+        "平米あたり工事費予定額", "平方メートルあたり工事費予定額",
+        "m2あたり工事費予定額", "㎡あたり工事費予定額", "m²あたり工事費予定額",
+    )
+    if not any(term in metric for term in per_sqm_terms):
+        return None
+    per_m2_man_yen = _unit_to_man_yen(row.get("値", 0), row.get("単位", ""))
+    if per_m2_man_yen is None:
+        return None
+    return per_m2_man_yen * TSUBO_M2
+
+
+def build_cost_benchmarks(cost):
+    """Calculate comparable annual benchmarks from the official cost-table indicators.
+
+    Monetary values are normalized to 万円 or 億円, and area to 坪／戸.
+    """
+    if cost is None or cost.empty:
+        return pd.DataFrame()
+    rows = []
+    for (year, region), group in cost.groupby(["年", "地域"]):
+        metrics = [
+            (unicodedata.normalize("NFKC", clean_text(row["指標"])), float(row["値"]), str(row.get("単位", "")))
+            for _, row in group.iterrows()
+        ]
+
+        def find_value(tokens, excludes=()):
+            for label, value, unit in metrics:
+                if all(t in label for t in tokens) and not any(t in label for t in excludes):
+                    return value, unit
+            return None, ""
+
+        dwelling_count, count_unit = find_value(("戸数",), ("１戸", "1戸", "戸あたり"))
+        total_area, area_unit = find_value(("床面積",), ("１戸", "1戸", "戸あたり"))
+        total_cost, total_cost_unit = find_value(("工事費予定額",), ("１戸", "1戸", "一戸", "戸あたり", "平米あたり", "平方メートルあたり", "m2あたり", "㎡あたり"))
+        per_house, per_house_unit = find_value(("戸あたり工事費予定額",))
+        per_sqm_row = next((
+            (v, u) for label, v, u in metrics
+            if any(term in label.lower() for term in (
+                "平米あたり工事費予定額", "平方メートルあたり工事費予定額",
+                "m2あたり工事費予定額", "㎡あたり工事費予定額", "m²あたり工事費予定額"
+            ))
+        ), None)
+
+        area_sqm = _unit_to_sqm(total_area, area_unit) if total_area is not None else None
+        if dwelling_count and area_sqm is not None and dwelling_count > 0:
+            rows.append({
+                "年": int(year), "地域": region, "指標": "平均延床面積",
+                "値": area_sqm / dwelling_count / TSUBO_M2, "単位": "坪／戸"
+            })
+
+        if total_cost is not None:
+            total_man_yen = _unit_to_man_yen(total_cost, total_cost_unit)
+            if total_man_yen is not None:
+                rows.append({
+                    "年": int(year), "地域": region, "指標": "工事費予定額（総額）",
+                    "値": total_man_yen / 10000, "単位": "億円"
+                })
+
+        if per_house is not None:
+            per_house_man_yen = _unit_to_man_yen(per_house, per_house_unit)
+            if per_house_man_yen is not None:
+                rows.append({
+                    "年": int(year), "地域": region, "指標": "1戸あたり工事費予定額",
+                    "値": per_house_man_yen, "単位": "万円／戸"
+                })
+
+        if per_sqm_row:
+            raw_value, raw_unit = per_sqm_row
+            fake = {"指標": "1m2あたり工事費予定額", "値": raw_value, "単位": raw_unit}
+            per_tsubo = _estimate_cost_per_tsubo(fake)
+            if per_tsubo is not None:
+                rows.append({
+                    "年": int(year), "地域": region, "指標": "坪単価",
+                    "値": per_tsubo, "単位": "万円／坪"
+                })
+    return pd.DataFrame(rows)
+
+
+def municipal_pdf_specs(bundle):
+    specs = []
+    building = bundle.get("building", pd.DataFrame())
+    if not building.empty:
+        latest = int(building["年"].max())
+        current = building[building["年"] == latest]
+        for metric, label, unit in (
+            ("木造建築物数", "木造建築物数", "棟"),
+            ("木造建築物床面積㎡", "木造建築物の床面積", "㎡"),
+            ("平均床面積坪", "平均床面積", "坪／棟"),
+        ):
+            if metric in current.columns:
+                subset = current[["地域", metric]].dropna().rename(columns={"地域": "指標", metric: "値"}).copy()
+                if not subset.empty:
+                    specs.append({"title": f"{latest}年度・{label}（市区町村／都道府県／全国）", "data": subset, "kind": "bar", "unit": unit})
+    income_summary = bundle.get("income_summary", pd.DataFrame())
+    if not income_summary.empty:
+        for metric, title, unit in (
+            ("推計平均世帯年収（万円）", "推計平均世帯年収の比較（2023年）", "万円"),
+            ("500万円以上の世帯割合（％）", "世帯年収500万円以上の割合（2023年）", "%"),
+        ):
+            if metric in income_summary.columns:
+                data = income_summary[["地域", metric]].dropna().rename(columns={"地域": "指標", metric: "値"})
+                if not data.empty:
+                    specs.append({"title": title, "data": data, "kind": "bar", "unit": unit})
+    income = bundle.get("income_distribution", pd.DataFrame())
+    if not income.empty:
+        plot = income.copy()
+        plot["指標"] = plot["年収階級"].astype(str) + "・" + plot["地域"].astype(str)
+        specs.append({"title": "世帯年収階級別の構成比（2023年）", "data": plot[["指標", "構成比"]].rename(columns={"構成比": "値"}), "kind": "bar", "unit": "%"})
+    cost_bench = build_cost_benchmarks(bundle.get("cost", pd.DataFrame()))
+    if not cost_bench.empty:
+        latest_year = int(cost_bench["年"].max())
+        current = cost_bench[cost_bench["年"] == latest_year]
+        for metric in ("平均延床面積", "坪単価", "1戸あたり工事費予定額", "工事費予定額（総額）"):
+            subset = current[current["指標"] == metric]
+            if not subset.empty:
+                data = subset[["地域", "値"]].rename(columns={"地域": "指標"})
+                specs.append({"title": f"{latest_year}年・{metric}（都道府県／全国参考値）", "data": data, "kind": "bar", "unit": str(subset["単位"].iloc[0])})
+    return specs
+
+
+def render_municipal_market_page(selected_region):
+    st.markdown("### 市区町村・住宅取得環境")
+    st.markdown("市区町村の建築動向・世帯年収と、都道府県／全国の住宅工事費を比較します。")
+    st.caption("市区町村の木造建築物数・床面積は住宅以外も含む建築物全体です。工事費は都道府県・全国、世帯年収は2023年調査の参考値です。")
+    try:
+        estat_app_id = st.secrets.get("ESTAT_APP_ID", "")
+    except Exception:
+        estat_app_id = ""
+    if not estat_app_id:
+        st.warning("この画面の自動取得にはe-Stat APIアプリケーションIDが必要です。既存のリフォーム市場と同じ `ESTAT_APP_ID` を使用します。")
+        st.markdown("[e-Stat API利用登録](https://www.e-stat.go.jp/api/)")
+        st.markdown(f"[市区町村別の木造建築物統計]({ESTAT_MUNICIPAL_BUILDING_URL})")
+        st.markdown(f"[市区町村別の世帯年収分布]({ESTAT_HOUSEHOLD_INCOME_URL})")
+        st.markdown(f"[住宅工事費統計]({ESTAT_HOUSING_COST_URL})")
+        return
+
+    try:
+        with st.spinner("市区町村の選択肢をe-Statから取得しています..."):
+            building_meta = load_estat_table_metadata(estat_app_id, ESTAT_MUNICIPAL_BUILDING_STATS_ID)
+    except Exception as exc:
+        st.error("市区町村の一覧を取得できませんでした。")
+        with st.expander("エラー詳細"):
+            st.code(str(exc))
+        return
+    default_pref = selected_region if selected_region in PREF_SET else "北海道"
+    pref_index = PREFECTURES.index(default_pref)
+    pref = st.selectbox("都道府県", PREFECTURES, index=pref_index, key="municipal_prefecture")
+    if st.session_state.get("_municipal_prefecture_for_city") != pref:
+        st.session_state.pop("municipal_city", None)
+        st.session_state.pop("municipal_selection", None)
+        st.session_state.pop("municipal_pdf_bytes", None)
+        st.session_state.pop("municipal_pdf_signature", None)
+        st.session_state["_municipal_prefecture_for_city"] = pref
+    try:
+        pref_code, municipalities = _municipality_options(building_meta, pref)
+    except Exception as exc:
+        st.error(str(exc))
+        return
+    if not municipalities:
+        st.warning(f"{pref}の市区町村コードを取得できませんでした。")
+        return
+    labels = [x["label"] for x in municipalities]
+    option_by_label = {x["label"]: x for x in municipalities}
+    default_label = next((x["label"] for x in municipalities if x["name"].endswith("市")), labels[0])
+    selected_label = st.selectbox("市区町村", labels, index=labels.index(default_label), key="municipal_city")
+    city = option_by_label[selected_label]
+
+    st.caption("市区町村の建築統計は2020年度以降、年次で表示します。費用は都道府県・全国の参考値、世帯年収は2023年調査です。")
+    city_name = city["name"]
+    st.session_state["municipal_selection"] = {
+        "prefecture": pref, "municipality_code": city["code"], "municipality_name": city_name
+    }
+    try:
+        with st.spinner("市区町村・都道府県・全国の統計を取得しています（初回のみ時間がかかります）..."):
+            bundle = cached_municipal_dashboard_data(estat_app_id, pref, city["code"], city["name"])
+        city_name = bundle.get("municipality_name") or city["name"]
+        st.session_state["municipal_selection"] = {
+            "prefecture": pref, "municipality_code": city["code"], "municipality_name": city_name
+        }
+    except Exception as exc:
+        st.error("市区町村データを取得できませんでした。")
+        with st.expander("エラー詳細"):
+            st.code(str(exc))
+        st.markdown(f"[市区町村別建築統計]({ESTAT_MUNICIPAL_BUILDING_URL})")
+        st.markdown(f"[世帯年収分布]({ESTAT_HOUSEHOLD_INCOME_URL})")
+        st.markdown(f"[住宅工事費統計]({ESTAT_HOUSING_COST_URL})")
+        return
+
+    building = bundle["building"]
+    if not building.empty:
+        latest_year = int(building["年"].max())
+        latest = building[building["年"] == latest_year]
+        city_row = latest[latest["地域"] == city_name]
+        pref_row = latest[latest["地域"] == pref]
+        national_row = latest[latest["地域"] == "全国"]
+        k1, k2, k3, k4 = st.columns(4)
+        def fmt_num(df, col, unit=""):
+            if df.empty or col not in df.columns or pd.isna(df.iloc[0][col]):
+                return "—"
+            return f"{df.iloc[0][col]:,.1f}{unit}" if unit == "坪" else f"{df.iloc[0][col]:,.0f}{unit}"
+        k1.metric(f"{latest_year}年度・{city_name}", fmt_num(city_row, "木造建築物数", "棟"))
+        k2.metric(f"{latest_year}年度・{pref}合計", fmt_num(pref_row, "木造建築物数", "棟"))
+        k3.metric(f"{latest_year}年度・全国合計", fmt_num(national_row, "木造建築物数", "棟"))
+        k4.metric("市区町村・平均床面積", fmt_num(city_row, "平均床面積坪", "坪"))
+        st.markdown("#### 木造建築物の数（用途全体）")
+        count_chart = building.melt(id_vars=["年", "地域"], value_vars=["木造建築物数"], var_name="指標", value_name="値")
+        count_fig = px.line(count_chart, x="年", y="値", color="地域", markers=True,
+                            labels={"年": "年度", "値": "建築物の数（棟）", "地域": "比較地域"})
+        count_fig.update_layout(height=360, margin=dict(l=8, r=10, t=18, b=8))
+        count_fig.update_xaxes(tickformat="d年")
+        count_fig.update_traces(mode="lines+markers")
+        st.plotly_chart(count_fig, use_container_width=True, config={"displayModeBar": False})
+        st.markdown("#### 木造建築物の床面積・1棟あたり平均坪数")
+        area_fig = px.line(building, x="年", y="平均床面積坪", color="地域", markers=True,
+                           labels={"年": "年度", "平均床面積坪": "平均床面積（坪／棟）", "地域": "比較地域"})
+        area_fig.update_layout(height=340, margin=dict(l=8, r=10, t=18, b=8))
+        area_fig.update_xaxes(tickformat="d年")
+        st.plotly_chart(area_fig, use_container_width=True, config={"displayModeBar": False})
+        st.caption("この統計は住宅に限らず、木造建築物全体（住宅・非住宅を含む）です。木造戸建住宅だけの数値ではありません。")
+    else:
+        st.warning("選択した市区町村・都道府県の木造建築物データは取得できませんでした。")
+        if bundle.get("errors", {}).get("building"):
+            with st.expander("建築物統計の取得状況"):
+                st.code(bundle["errors"]["building"])
+
+    income_summary = bundle["income_summary"]
+    income_distribution = bundle["income_distribution"]
+    st.markdown("#### 世帯年収の比較（2023年）")
+    if not income_summary.empty:
+        cols = st.columns(min(3, len(income_summary)))
+        for idx, (_, row) in enumerate(income_summary.iterrows()):
+            cols[idx].metric(f"{row['地域']}・推計平均年収", f"{row['推計平均世帯年収（万円）']:,.0f}万円")
+        if not income_distribution.empty:
+            income_fig = px.bar(income_distribution, x="年収階級", y="構成比", color="地域", barmode="group",
+                                labels={"年収階級": "世帯年収階級", "構成比": "世帯構成比（％）", "地域": "比較地域"})
+            income_fig.update_layout(height=390, margin=dict(l=8, r=10, t=18, b=8), xaxis_tickangle=-20)
+            st.plotly_chart(income_fig, use_container_width=True, config={"displayModeBar": False})
+        st.caption("平均年収は公表された平均値ではありません。収入階級の中心値を使った推計で、「1500万円以上」は1750万円と仮定しています。市区町村データは人口1万5千人以上の町村などに限られます。")
+    else:
+        st.info("この市区町村は2023年住宅・土地統計調査の年収階級表に掲載されていない可能性があります。市区町村の収入データは全町村を網羅していません。")
+
+    cost = bundle["cost"]
+    st.markdown("#### 木造・一戸建て・持家の工事費（都道府県・全国の参考値）")
+    cost_bench = build_cost_benchmarks(cost)
+    if not cost_bench.empty:
+        cost_years = sorted(cost_bench["年"].dropna().astype(int).unique().tolist())
+        cost_year = st.selectbox("工事費の対象年", cost_years, index=len(cost_years)-1, format_func=lambda y: f"{y}年", key="municipal_cost_year")
+        cost_latest = cost_bench[cost_bench["年"] == cost_year]
+        benchmark_metrics = [m for m in ("平均延床面積", "坪単価", "1戸あたり工事費予定額", "工事費予定額（総額）") if m in set(cost_latest["指標"])]
+        for metric in benchmark_metrics:
+            metric_rows = cost_latest[cost_latest["指標"] == metric].copy()
+            if metric_rows.empty:
+                continue
+            unit = str(metric_rows["単位"].iloc[0])
+            cost_fig = px.bar(metric_rows, x="地域", y="値", text_auto=",.1f",
+                              labels={"地域": "比較地域", "値": f"{metric}（{unit}）"})
+            cost_fig.update_traces(textposition="outside", cliponaxis=False)
+            cost_fig.update_layout(height=300, margin=dict(l=8, r=24, t=18, b=8), showlegend=False)
+            cost_fig.update_yaxes(tickformat=",.0f", exponentformat="none", showexponent="none")
+            st.markdown(f"**{metric}**")
+            st.plotly_chart(cost_fig, use_container_width=True, config={"displayModeBar": False})
+        st.caption("工事費は市区町村別に公表されていないため、選択した都道府県と全国の参考値です。木造・一戸建て・持家に絞っています。")
+    else:
+        st.info("住宅工事費統計の自動取得ができませんでした。")
+        if bundle.get("errors", {}).get("cost"):
+            with st.expander("工事費統計の取得状況"):
+                st.code(bundle["errors"]["cost"])
+        st.markdown(f"[e-Statの住宅工事費統計]({ESTAT_HOUSING_COST_URL})")
+
+    with st.expander("データ出典・算出方法"):
+        st.markdown(f"- [市区町村別・構造別の建築物数／床面積]({ESTAT_MUNICIPAL_BUILDING_URL})（2020年度以降）")
+        st.markdown(f"- [世帯の年間収入階級別主世帯数]({ESTAT_HOUSEHOLD_INCOME_URL})（2023年調査）")
+        st.markdown(f"- [新築住宅の工事費予定額・1㎡あたり工事費]({ESTAT_HOUSING_COST_URL})")
+        st.write("坪換算：1坪＝3.305785㎡。坪単価は1㎡あたり工事費予定額×3.305785で算出しています。")
+        st.write("平均世帯年収は収入階級の中心値による推計です。1500万円以上の階級は1750万円として計算しています。")
+        for key, message in bundle.get("errors", {}).items():
+            st.caption(f"{key}：{message}")
+
+    municipal_specs = municipal_pdf_specs(bundle)
+    municipal_signature = f"{pref}|{city['code']}|{sorted(building['年'].unique().tolist()) if not building.empty else []}"
+    if st.session_state.get("municipal_pdf_signature") != municipal_signature:
+        st.session_state.pop("municipal_pdf_bytes", None)
+        st.session_state.pop("municipal_pdf_signature", None)
+    if st.button("市区町村・住宅取得環境をPDFに出力", type="primary", key="municipal_pdf_button"):
+        try:
+            st.session_state["municipal_pdf_bytes"] = create_multi_chart_pdf(
+                "市区町村・住宅取得環境", f"{pref}・{city_name}", "公表統計の最新期間", municipal_specs)
+            st.session_state["municipal_pdf_signature"] = municipal_signature
+        except Exception as exc:
+            st.error(f"PDFの作成に失敗しました: {exc}")
+    if st.session_state.get("municipal_pdf_signature") == municipal_signature and st.session_state.get("municipal_pdf_bytes"):
+        st.download_button("市区町村分析PDFをダウンロード", st.session_state["municipal_pdf_bytes"],
+                           file_name=f"住宅取得環境_{pref}_{city_name}.pdf", mime="application/pdf", key="municipal_pdf_download")
+
 def with_national_aggregate(data: pd.DataFrame) -> pd.DataFrame:
     """Aggregate 47 prefectures only; never show partial data as a national total."""
     if data.empty:
@@ -2178,6 +3005,47 @@ def build_all_screens_pdf(region_label, selected_region, start_date, end_date, r
         documents.append(("リフォーム市場", create_status_pdf("リフォーム市場", region_label, period_label,
                                                                "e-Stat APIからデータを取得できませんでした。" + str(exc)[:180], ESTAT_RENOVATION_TABLE_URL)))
 
+    # Municipality / housing acquisition environment. The user selects a municipality on that page;
+    # preserve that selection in session_state so the combined PDF can include this section too.
+    municipal_selection = st.session_state.get("municipal_selection")
+    if municipal_selection:
+        try:
+            try:
+                api_key = st.secrets.get("ESTAT_APP_ID", "")
+            except Exception:
+                api_key = ""
+            if api_key:
+                bundle = cached_municipal_dashboard_data(
+                    api_key,
+                    municipal_selection["prefecture"],
+                    municipal_selection["municipality_code"],
+                    municipal_selection.get("municipality_name"),
+                )
+                specs = municipal_pdf_specs(bundle)
+                if specs:
+                    documents.append(("市区町村・住宅取得環境", create_multi_chart_pdf(
+                        "市区町村・住宅取得環境",
+                        f"{municipal_selection['prefecture']}・{municipal_selection['municipality_name']}",
+                        "公表統計の最新期間", specs)))
+                else:
+                    documents.append(("市区町村・住宅取得環境", create_status_pdf(
+                        "市区町村・住宅取得環境", municipal_selection["municipality_name"], period_label,
+                        "市区町村分析のPDFデータがありません。", ESTAT_MUNICIPAL_BUILDING_URL)))
+            else:
+                documents.append(("市区町村・住宅取得環境", create_status_pdf(
+                    "市区町村・住宅取得環境", municipal_selection["municipality_name"], period_label,
+                    "ESTAT_APP_IDが未設定のため、市区町村分析を取得できません。", ESTAT_MUNICIPAL_BUILDING_URL)))
+        except Exception as exc:
+            notes.append(f"市区町村・住宅取得環境：{exc}")
+            documents.append(("市区町村・住宅取得環境", create_status_pdf(
+                "市区町村・住宅取得環境", municipal_selection["municipality_name"], period_label,
+                "市区町村データを取得できませんでした。" + str(exc)[:180], ESTAT_MUNICIPAL_BUILDING_URL)))
+    else:
+        documents.append(("市区町村・住宅取得環境", create_status_pdf(
+            "市区町村・住宅取得環境", region_label, period_label,
+            "市区町村・住宅取得環境の画面で市区町村を選択してから、一括PDFを作成してください。",
+            ESTAT_MUNICIPAL_BUILDING_URL)))
+
     return merge_pdf_documents(documents), notes
 
 
@@ -2280,7 +3148,7 @@ with st.sidebar:
     st.header("③ 分析画面")
     analysis_view = st.radio(
         "表示する分析", 
-        ["市場概況", "住宅着工の詳細", "構造・建て方分析", "建築規模・非住宅", "リフォーム市場"],
+        ["市場概況", "住宅着工の詳細", "構造・建て方分析", "建築規模・非住宅", "リフォーム市場", "市区町村・住宅取得環境"],
         index=0,
         key="analysis_view",
     )
@@ -2323,14 +3191,19 @@ for label, metric, accent in card_metrics:
     yoy_color = "#d92d20" if ratio is not None and ratio > 100 else "#1570ef" if ratio is not None else "#667085"
     cards.append({"label": label, "metric": metric, "color": accent, "value": value_text, "previous": previous_text, "yoy": yoy_text, "yoy_color": yoy_color, "current": current, "previous_value": previous, "ratio": ratio})
 
-# Combined PDF export is available from every analysis screen, and includes all 5 screens.
-combined_signature = f"{selected_region}|{start_date}|{end_date}|{latest_month}"
+# Combined PDF export is available from every analysis screen, including the municipality / housing-acquisition page.
+municipal_signature_part = st.session_state.get("municipal_selection", {})
+municipal_signature = (
+    f"{municipal_signature_part.get('prefecture', '')}|"
+    f"{municipal_signature_part.get('municipality_code', '')}"
+)
+combined_signature = f"{selected_region}|{start_date}|{end_date}|{latest_month}|{municipal_signature}"
 if st.session_state.get("all_screens_pdf_signature") != combined_signature:
     st.session_state.pop("all_screens_pdf_bytes", None)
     st.session_state.pop("all_screens_pdf_signature", None)
 with st.container(border=True):
     st.markdown("**PDFレポート**")
-    st.caption("市場概況・住宅着工の詳細・構造／建て方・建築規模／非住宅・リフォーム市場を1つのPDFにまとめます。")
+    st.caption("市場概況・住宅着工詳細・構造／建て方・建築規模／非住宅・リフォーム・市区町村／住宅取得環境をA4 PDFにまとめます。市区町村分析は、先に対象自治体を選択してください。")
     if st.button("全分析画面を1つのPDFにまとめる", type="primary", key="all_screens_pdf_button"):
         try:
             with st.spinner("全分析画面のデータとグラフをまとめています。初回は取得に時間がかかる場合があります..."):
@@ -2819,3 +3692,6 @@ elif analysis_view == "リフォーム市場":
         with st.expander("エラー詳細"):
             st.code(str(exc))
         st.markdown(f"[e-Statの施工地域別受注高（参考表2）を開く]({ESTAT_RENOVATION_TABLE_URL})")
+elif analysis_view == "市区町村・住宅取得環境":
+    render_municipal_market_page(selected_region)
+
