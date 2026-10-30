@@ -10,7 +10,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-APP_VERSION = "A4-PDF v6・数値ラベル"
+APP_VERSION = "A4-PDF v7・旧形式構造表対応"
 
 # The e-Stat monthly timeseries list. "layout=dataset" is used by the current listing.
 ESTAT_HOUSING_LIST_URL = (
@@ -708,6 +708,28 @@ def _unit_for_metric(label, default_unit, workbook_unit):
     return workbook_unit or "値"
 
 
+def _is_legacy_structure_table(df: pd.DataFrame) -> bool:
+    """Recognize the historical e-Stat multi-row header even when Excel merges cells unusually."""
+    if df is None or df.empty or df.shape[1] < 8:
+        return False
+    head = df.head(35).fillna("")
+    normalized = [normalize_pref_name(v) for v in head.values.flatten().tolist()]
+    col_b = {normalize_pref_name(v) for v in head.iloc[:, 1].tolist()} if head.shape[1] > 1 else set()
+    all_text = "".join(normalized)
+    # Most editions have the hierarchy labels in the second column and the data measures
+    # in the following header rows. Some Excel exports shift the hierarchy labels slightly,
+    # so also recognize the complete set anywhere in the upper header area.
+    has_structure = "構造別" in col_b or "構造別" in all_text
+    has_building_form = "建て方別" in col_b or "建て方別" in all_text
+    has_use_relation = "利用関係別" in col_b or "利用関係別" in all_text
+    has_count = "戸数" in all_text
+    has_floor_area = "床面積" in all_text and "合計" in all_text
+    has_wood = "木造" in all_text
+    has_prefecture_heading = any(token in all_text for token in ("都道", "府県", "都道府県"))
+    return (has_structure and has_building_form and has_use_relation
+            and has_count and has_floor_area and has_wood and has_prefecture_heading)
+
+
 def _parse_legacy_structure_table(df, period, sheet_name, dataset_name, default_unit="戸"):
     """Parse e-Stat's historical annual housing table where prefecture names are vertically split.
 
@@ -732,13 +754,13 @@ def _parse_legacy_structure_table(df, period, sheet_name, dataset_name, default_
     # caused by full-width characters or invisible spacing in older workbooks.
     structure_row = next((idx for idx, vals, joined in normalized_rows
                           if len(vals) > 1 and vals[1] == "構造別"
-                          and "木造" in joined and "総計" in joined), None)
+                          and "木造" in joined and "総" in joined and "計" in joined), None)
     building_row = next((idx for idx, vals, joined in normalized_rows
                          if len(vals) > 1 and vals[1] == "建て方別"
                          and "一戸建" in joined and "共同住宅" in joined), None)
     measure_row = next((idx for idx, vals, joined in normalized_rows
                         if len(vals) > 1 and vals[1] == "利用関係別"
-                        and "戸数" in joined and "床面積の合計" in joined), None)
+                        and "戸数" in joined and "床面積" in joined and "合計" in joined), None)
     if structure_row is None or building_row is None or measure_row is None:
         return None, "構造別・建て方別・利用関係別の複数段ヘッダーを特定できない"
 
@@ -900,37 +922,18 @@ def parse_regional_metric_workbook(sheets, frequency="月次", dataset_name="e-S
 
         # Historical annual housing structure tables split prefecture names vertically across
         # utilization rows. Parse that layout explicitly before the generic exact-label parser.
-        if frequency == "年次":
-            # Detect the legacy multi-row table by the actual header cells, not just by a
-            # concatenated title preview. Historical files sometimes include wide spaces or
-            # shifted header rows, while the title itself can contain many of the same words.
-            head = df.head(30).fillna("")
-            normalized_head = [normalize_pref_name(v) for v in head.values.flatten().tolist()]
-            header_col_b = set(
-                normalize_pref_name(v) for v in head.iloc[:, 1].tolist()
-            ) if head.shape[1] > 1 else set()
-            legacy_markers = (
-                {"構造別", "建て方別", "利用関係別"}.issubset(header_col_b)
-                and any("戸数" in v for v in normalized_head)
+        if frequency == "年次" and _is_legacy_structure_table(df):
+            # Parse the historical table before generic region scanning. In these files,
+            # one prefecture name can be split vertically over the five utilisation rows:
+            # e.g. 鹿 / (blank) / 児 / (blank) / 島 -> 鹿児島県.
+            special_data, special_error = _parse_legacy_structure_table(
+                df, period, sheet_name, dataset_name, default_unit=default_unit
             )
-            # Older e-Stat workbooks vary in merged-cell layout and sometimes omit or split
-            # the exact wording "床面積の合計". Detect the table from its three hierarchy
-            # headings plus a count header; the dedicated parser then validates the detail.
-            title_markers = (
-                any("構造別" in v for v in normalized_head)
-                and any("建て方別" in v for v in normalized_head)
-                and any("利用関係別" in v for v in normalized_head)
-                and any("戸数" in v for v in normalized_head)
-            )
-            if legacy_markers or title_markers:
-                special_data, special_error = _parse_legacy_structure_table(
-                    df, period, sheet_name, dataset_name, default_unit=default_unit
-                )
-                if special_data is not None and not special_data.empty:
-                    records.extend(special_data.to_dict("records"))
-                else:
-                    debug.append(f"{sheet_name}: {special_error or '旧形式の構造別表を解析できない'}")
-                continue
+            if special_data is not None and not special_data.empty:
+                records.extend(special_data.to_dict("records"))
+            else:
+                debug.append(f"{sheet_name}: 旧形式の構造・建て方表を解析できない: {special_error or '原因不明'}")
+            continue
 
         # Find both possible table orientations.
         pref_columns = []
@@ -950,30 +953,6 @@ def parse_regional_metric_workbook(sheets, frequency="月次", dataset_name="e-S
         row_best = max(pref_columns, key=lambda item: (len(set(item[1].values())), -item[0])) if pref_columns else None
         col_best = max(pref_rows, key=lambda item: (len(set(item[1].values())), -item[0])) if pref_rows else None
         if row_best is None and col_best is None:
-            # Final fallback for historical structure tables: some old exports have every
-            # prefecture name split across several utilization rows, so no single column or
-            # row contains 10 complete prefecture names. Re-try the dedicated legacy parser
-            # even if the initial header detector could not confidently classify the sheet.
-            if frequency == "年次" and df.shape[1] > 7:
-                normalized_head_all = [
-                    normalize_pref_name(v) for v in df.head(30).fillna("").values.flatten().tolist()
-                ]
-                looks_like_legacy_structure = (
-                    any("構造別" in v for v in normalized_head_all)
-                    and any("建て方別" in v for v in normalized_head_all)
-                    and any("利用関係別" in v for v in normalized_head_all)
-                    and any("戸数" in v for v in normalized_head_all)
-                )
-                if looks_like_legacy_structure:
-                    legacy_data, legacy_error = _parse_legacy_structure_table(
-                        df, period, sheet_name, dataset_name, default_unit=default_unit
-                    )
-                    if legacy_data is not None and not legacy_data.empty:
-                        records.extend(legacy_data.to_dict("records"))
-                    else:
-                        debug.append(f"{sheet_name}: 旧形式の構造別表の抽出に失敗: {legacy_error or '詳細不明'}")
-                    continue
-
             preview_rows = df.head(12).fillna("").astype(str).values.tolist()
             preview_cols = df.iloc[:, :min(12, df.shape[1])].tail(12).fillna("").astype(str).values.tolist()
             debug.append(
