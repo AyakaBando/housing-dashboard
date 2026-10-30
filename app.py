@@ -1185,6 +1185,21 @@ ESTAT_HOUSEHOLD_INCOME_URL = "https://www.e-stat.go.jp/stat-search/database?stat
 ESTAT_HOUSING_COST_URL = "https://www.e-stat.go.jp/stat-search/database?statdisp_id=0003114524"
 TSUBO_M2 = 3.305785
 
+# e-Stat standard area codes. Table 0004019380 is a municipality-level table;
+# unlike many other tables it does not include prefecture rows in CLASS_INF.
+PREFECTURE_AREA_PREFIX = {
+    "北海道": "01", "青森県": "02", "岩手県": "03", "宮城県": "04", "秋田県": "05",
+    "山形県": "06", "福島県": "07", "茨城県": "08", "栃木県": "09", "群馬県": "10",
+    "埼玉県": "11", "千葉県": "12", "東京都": "13", "神奈川県": "14", "新潟県": "15",
+    "富山県": "16", "石川県": "17", "福井県": "18", "山梨県": "19", "長野県": "20",
+    "岐阜県": "21", "静岡県": "22", "愛知県": "23", "三重県": "24", "滋賀県": "25",
+    "京都府": "26", "大阪府": "27", "兵庫県": "28", "奈良県": "29", "和歌山県": "30",
+    "鳥取県": "31", "島根県": "32", "岡山県": "33", "広島県": "34", "山口県": "35",
+    "徳島県": "36", "香川県": "37", "愛媛県": "38", "高知県": "39", "福岡県": "40",
+    "佐賀県": "41", "長崎県": "42", "熊本県": "43", "大分県": "44", "宮崎県": "45",
+    "鹿児島県": "46", "沖縄県": "47",
+}
+
 
 def _as_estat_list(value):
     if value is None:
@@ -1262,6 +1277,47 @@ def load_estat_table_values(app_id: str, stats_data_id: str, area_code: str, fil
     return values
 
 
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def load_estat_table_values_by_area_range(
+    app_id: str, stats_data_id: str, area_from: str, area_to: str, filters_json: str = "{}"
+) -> list:
+    """Fetch a range of standard area codes, paging if the API returns NEXT_KEY."""
+    if not app_id:
+        raise RuntimeError("ESTAT_APP_ID が設定されていません。")
+    import json
+    filters = json.loads(filters_json or "{}")
+    start_position = 1
+    all_values = []
+    for _ in range(5):
+        params = {
+            "appId": app_id, "statsDataId": stats_data_id, "lang": "J",
+            "limit": 100000, "startPosition": start_position,
+            "cdAreaFrom": str(area_from), "cdAreaTo": str(area_to),
+        }
+        params.update({str(k): str(v) for k, v in filters.items() if v not in (None, "")})
+        response = requests.get(
+            "https://api.e-stat.go.jp/rest/2.1/app/json/getStatsData",
+            params=params, headers=HEADERS, timeout=90,
+        )
+        response.raise_for_status()
+        payload = response.json().get("GET_STATS_DATA", {}) or {}
+        result = payload.get("RESULT", {}) or {}
+        if str(result.get("STATUS", "0")) != "0":
+            raise RuntimeError(f"e-Stat地域コード範囲取得エラー: {result.get('ERROR_MSG', result)}")
+        statistical = payload.get("STATISTICAL_DATA", {}) or {}
+        data_inf = statistical.get("DATA_INF", {}) or {}
+        all_values.extend(_as_estat_list(data_inf.get("VALUE")))
+        result_inf = statistical.get("RESULT_INF", {}) or {}
+        next_key = result_inf.get("NEXT_KEY")
+        if not next_key:
+            break
+        next_position = int(next_key)
+        if next_position <= start_position:
+            break
+        start_position = next_position
+    return all_values
+
+
 def _estat_dim(dimensions, *tokens):
     for dim in dimensions:
         name = clean_text(dim.get("name", ""))
@@ -1307,30 +1363,83 @@ def _find_area_code(dimensions, area_name):
 
 
 def _municipality_options(dimensions, prefecture):
+    """Build municipality options using the first two digits of e-Stat standard area codes.
+
+    Table 0004019380 contains municipality/ward areas (e.g. 01100 Sapporo,
+    01101 Chuo-ku) but does not publish prefecture-level CLASS entries. Therefore
+    do not require a prefecture row to exist in this table.
+    """
     area_dim = _estat_area_catalog(dimensions)
-    pref_class = None
-    for cls in area_dim.get("classes", []):
-        if match_prefecture(cls.get("name", "")) == prefecture:
-            pref_class = cls
-            break
-    if not pref_class:
-        raise RuntimeError(f"{prefecture}の地域コードを統計表から特定できません。")
-    pref_code = str(pref_class.get("code", ""))
-    prefix = pref_code[:2]
+    prefix = PREFECTURE_AREA_PREFIX.get(prefecture)
+    if not prefix:
+        raise RuntimeError(f"都道府県コードの対応表に{prefecture}がありません。")
+
     options = []
     for cls in area_dim.get("classes", []):
-        code = str(cls.get("code", ""))
+        code = str(cls.get("code", "")).strip()
         name = str(cls.get("name", "")).strip()
-        if not code or not name or code == pref_code or len(code) != 5 or not code.startswith(prefix):
+        if len(code) != 5 or not code.startswith(prefix) or code[2:] == "000" or not name:
             continue
-        if name == "全国" or match_prefecture(name):
+        # Retain actual municipality/city-ward records; exclude county and
+        # subprefecture group headings which are not selectable municipalities.
+        if not name.endswith(("市", "区", "町", "村")):
             continue
-        # Exclude aggregate / obsolete records; normal municipality and ward codes are five digits.
         if any(token in name for token in ("合計", "その他", "不詳")):
             continue
         options.append({"code": code, "name": name, "label": f"{name}（{code}）"})
+
+    # One code may be represented by a city aggregate and its wards. Keep both
+    # selectable; the selected area's published aggregate remains the display value.
+    options = list({x["code"]: x for x in options}.values())
     options.sort(key=lambda x: (x["name"], x["code"]))
-    return pref_code, options
+    if not options:
+        # Show enough metadata to diagnose a genuine table-code mismatch.
+        examples = [
+            f"{c.get('code')}:{c.get('name')}" for c in area_dim.get("classes", [])
+            if str(c.get("code", "")).startswith(prefix)
+        ][:20]
+        raise RuntimeError(
+            f"{prefecture}（標準地域コード先頭2桁={prefix}）の市区町村コードが統計表にありません。"
+            f" 地域分類の候補={examples}"
+        )
+    # Conventional five-digit prefecture code. This table may not contain an
+    # observation at this code; prefecture values are calculated from municipality leaves.
+    return f"{prefix}000", options
+
+
+def _municipality_leaf_codes(area_dim, prefix=None):
+    """Return lowest-level municipality/ward codes, avoiding city/ward double counts."""
+    classes = area_dim.get("classes", [])
+    valid = []
+    for cls in classes:
+        code = str(cls.get("code", "")).strip()
+        name = str(cls.get("name", "")).strip()
+        if len(code) != 5 or (prefix and not code.startswith(prefix)):
+            continue
+        if not name.endswith(("市", "区", "町", "村")):
+            continue
+        valid.append(cls)
+
+    code_set = {str(c.get("code", "")) for c in valid}
+    parent_codes = {
+        str(c.get("parent", "")) for c in valid
+        if str(c.get("parent", "")) in code_set
+    }
+    # Fallback for older metadata that omits @parentCode: designated cities and
+    # special-ward aggregates (e.g. 01100 Sapporo) have child ward codes.
+    for parent in valid:
+        pcode = str(parent.get("code", ""))
+        pname = str(parent.get("name", ""))
+        if not pname.endswith("市"):
+            continue
+        if any(
+            str(child.get("code", "")).startswith(pcode[:3])
+            and str(child.get("code", "")) != pcode
+            and str(child.get("name", "")).endswith("区")
+            for child in valid
+        ):
+            parent_codes.add(pcode)
+    return [str(c.get("code")) for c in valid if str(c.get("code")) not in parent_codes]
 
 
 def _parse_estat_api_rows(dimensions, values):
@@ -1526,60 +1635,102 @@ def build_municipal_dashboard_data(app_id, prefecture, municipality_code, munici
     # 1) Municipal wood-building count and floor area, plus prefecture/national comparisons.
     building_meta = None
     city_name = municipality_name or str(municipality_code)
-    pref_code = None
+    pref_code = PREFECTURE_AREA_PREFIX.get(prefecture, "") + "000"
     try:
         building_meta = load_estat_table_metadata(app_id, ESTAT_MUNICIPAL_BUILDING_STATS_ID)
         building_area_dim = _estat_area_catalog(building_meta)
-        pref_code, _ = _municipality_options(building_meta, prefecture)
-        nat_cls = _estat_class(building_area_dim, exact="全国") or _estat_class(building_area_dim, contains="全国")
-        nat_code = nat_cls.get("code") if nat_cls else "00000"
         city_name = _canonical_area_name(building_meta, municipality_code, city_name)
-        areas = [
-            (str(municipality_code), city_name),
-            (str(pref_code), prefecture),
-            (str(nat_code), "全国"),
-        ]
-        building_rows = load_area_table_frame(
-            app_id, ESTAT_MUNICIPAL_BUILDING_STATS_ID, building_meta, [x[0] for x in areas]
+
+        structure_dim = next((d for d in building_meta if "構造" in clean_text(d["name"])), None)
+        measure_dim = next((d for d in building_meta if any(t in clean_text(d["name"]) for t in ("表章項目", "項目"))), None)
+        if not measure_dim:
+            measure_dim = _find_measure_dimension(building_meta, ("建築物の数", "床面積の合計"))
+        if not structure_dim or not measure_dim:
+            raise RuntimeError("建築物統計の構造または表章項目を特定できませんでした。")
+
+        wood_cls = _estat_class(structure_dim, exact="木造")
+        count_cls = _estat_class(measure_dim, contains="建築物の数")
+        floor_cls = _estat_class(measure_dim, contains="床面積の合計")
+        if not wood_cls or not count_cls or not floor_cls:
+            raise RuntimeError("木造・建築物の数・床面積の分類コードを統計表から特定できませんでした。")
+
+        import json
+        api_filters = {}
+        for dim, selected_codes in ((structure_dim, [wood_cls["code"]]), (measure_dim, [count_cls["code"], floor_cls["code"]])):
+            param = _api_filter_for_dimension(dim, ",".join(str(x) for x in selected_codes))
+            api_filters.update(param)
+
+        # This table contains municipality/ward areas, not prefecture aggregates.
+        # Fetch all five-digit area codes once; calculate prefecture/national totals
+        # from the lowest-level municipality rows, avoiding city+ward double counts.
+        area_values = load_estat_table_values_by_area_range(
+            app_id, ESTAT_MUNICIPAL_BUILDING_STATS_ID, "00000", "47999",
+            json.dumps(api_filters, ensure_ascii=False, sort_keys=True),
         )
-        if not building_rows.empty:
-            structure_dim = next((d for d in building_meta if "構造" in clean_text(d["name"])), None)
-            measure_dim = next((d for d in building_meta if any(t in clean_text(d["name"]) for t in ("表章項目", "項目"))), None)
-            if not measure_dim:
-                measure_dim = _find_measure_dimension(building_meta, ("建築物の数", "床面積の合計"))
-            structure_col = structure_dim.get("name") if structure_dim else None
-            measure_col = measure_dim.get("name") if measure_dim else None
-            if structure_col and structure_col in building_rows.columns:
-                building_rows = building_rows[building_rows[structure_col].map(clean_text) == "木造"]
-            records = []
-            labels = {code: name for code, name in areas}
-            for _, row in building_rows.iterrows():
-                measure = clean_text(row.get(measure_col, "")) if measure_col else ""
-                if not ("建築物の数" in measure or "床面積の合計" in measure):
-                    continue
-                year = row.get("年")
-                if pd.isna(year):
-                    continue
-                code = str(row.get("地域コード", ""))
+        building_rows = _parse_estat_api_rows(building_meta, area_values)
+        if building_rows.empty:
+            raise RuntimeError("市区町村別の木造建築物データが空でした。")
+
+        structure_col = structure_dim.get("name")
+        measure_col = measure_dim.get("name")
+        building_rows = building_rows[
+            (building_rows[structure_col].map(clean_text) == clean_text(wood_cls["name"]))
+            & (building_rows[measure_col].map(clean_text).isin([clean_text(count_cls["name"]), clean_text(floor_cls["name"])]))
+        ].copy()
+
+        all_leaf_codes = set(_municipality_leaf_codes(building_area_dim))
+        pref_leaf_codes = set(_municipality_leaf_codes(building_area_dim, PREFECTURE_AREA_PREFIX.get(prefecture)))
+        selected_code = str(municipality_code)
+        records = []
+
+        def add_aggregated_region(region_name, codes):
+            subset = building_rows[building_rows["地域コード"].astype(str).isin(codes)]
+            if subset.empty:
+                return
+            aggregated = subset.groupby(["年", measure_col], as_index=False)["値"].sum()
+            for _, row in aggregated.iterrows():
                 records.append({
-                    "年": int(year),
-                    "地域": labels.get(code, row.get("地域名", code)),
-                    "地域コード": code,
-                    "指標": measure,
-                    "値": float(row["値"]),
-                    "単位": str(row.get("単位", "")),
+                    "年": int(row["年"]), "地域": region_name,
+                    "地域コード": prefecture if region_name == prefecture else "00000",
+                    "指標": str(row[measure_col]), "値": float(row["値"]),
+                    "単位": "",
                 })
-            raw_building = pd.DataFrame(records)
-            if not raw_building.empty:
-                count = raw_building[raw_building["指標"].str.contains("建築物の数", na=False)][["年", "地域", "値"]].rename(columns={"値": "木造建築物数"})
-                area = raw_building[raw_building["指標"].str.contains("床面積の合計", na=False)][["年", "地域", "値"]].rename(columns={"値": "木造建築物床面積㎡"})
-                result["building"] = count.merge(area, on=["年", "地域"], how="outer")
-                result["building"]["平均床面積坪"] = (
-                    result["building"]["木造建築物床面積㎡"]
-                    / result["building"]["木造建築物数"] / TSUBO_M2
-                )
+
+        # Selected municipality/ward uses the exact published area row. If the
+        # selected city aggregate is unavailable, sum its immediate child areas.
+        city_rows = building_rows[building_rows["地域コード"].astype(str) == selected_code]
+        if city_rows.empty:
+            child_codes = [
+                str(c.get("code", "")) for c in building_area_dim.get("classes", [])
+                if str(c.get("parent", "")) == selected_code
+            ]
+            if child_codes:
+                city_rows = building_rows[building_rows["地域コード"].astype(str).isin(child_codes)]
+                if not city_rows.empty:
+                    city_rows = city_rows.groupby(["年", measure_col], as_index=False).agg({"値": "sum", "単位": "first"})
+        if not city_rows.empty:
+            for _, row in city_rows.iterrows():
+                records.append({
+                    "年": int(row["年"]), "地域": city_name,
+                    "地域コード": selected_code, "指標": str(row[measure_col]),
+                    "値": float(row["値"]), "単位": str(row.get("単位", "")),
+                })
+
+        add_aggregated_region(prefecture, pref_leaf_codes)
+        add_aggregated_region("全国", all_leaf_codes)
+
+        raw_building = pd.DataFrame(records)
+        if not raw_building.empty:
+            # Keep the selected city, its prefecture aggregate, and national aggregate distinct.
+            count = raw_building[raw_building["指標"].map(clean_text) == clean_text(count_cls["name"])][["年", "地域", "値"]].rename(columns={"値": "木造建築物数"})
+            area = raw_building[raw_building["指標"].map(clean_text) == clean_text(floor_cls["name"])][["年", "地域", "値"]].rename(columns={"値": "木造建築物床面積㎡"})
+            result["building"] = count.merge(area, on=["年", "地域"], how="outer")
+            result["building"]["平均床面積坪"] = (
+                result["building"]["木造建築物床面積㎡"]
+                / result["building"]["木造建築物数"] / TSUBO_M2
+            )
         if result["building"].empty:
-            result["errors"]["building"] = "市区町村別・構造別の建築物データに数値がありません。"
+            result["errors"]["building"] = "市区町村・都道府県・全国の木造建築物データを集計できませんでした。"
     except Exception as exc:
         result["errors"]["building"] = str(exc)
 
@@ -1828,7 +1979,7 @@ def municipal_pdf_specs(bundle):
 def render_municipal_market_page(selected_region):
     st.markdown("### 市区町村・住宅取得環境")
     st.markdown("市区町村の建築動向・世帯年収と、都道府県／全国の住宅工事費を比較します。")
-    st.caption("市区町村の木造建築物数・床面積は住宅以外も含む建築物全体です。工事費は都道府県・全国、世帯年収は2023年調査の参考値です。")
+    st.caption("この統計表は市区町村別の地域コードを収録しているため、都道府県値・全国値は下位地域の合計から算出します。市区町村の木造建築物数・床面積は住宅以外も含む建築物全体です。")
     try:
         estat_app_id = st.secrets.get("ESTAT_APP_ID", "")
     except Exception:
